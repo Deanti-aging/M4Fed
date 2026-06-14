@@ -1,0 +1,11 @@
+experiment_name: "fedprox"
+federated:
+  method: "fedprox"
+  n_clients: 3
+  federated_rounds: 10
+  local_rounds: 10
+  fedprox_mu: 0.001
+training:
+  batch_size: 1
+  lr_neurofm: 5.0e-5
+  seed: 42

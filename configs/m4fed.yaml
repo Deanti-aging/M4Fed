@@ -1,0 +1,14 @@
+experiment_name: "m4fed"
+federated:
+  method: "m4fed"
+  n_clients: 2
+  warm_rounds: 5
+  federated_rounds: 10
+  local_rounds: 10
+  synth_ratio_fed: 0.1
+  synth_ratio_local: 1.0
+training:
+  batch_size: 1
+  lr_medmd: 1.0e-4
+  lr_neurofm: 5.0e-5
+  seed: 42
