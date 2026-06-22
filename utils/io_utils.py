@@ -1,10 +1,10 @@
 """CSV 保存、模型检查点读写、目录管理等 I/O 工具函数。"""
-from __future__ import annotations
-import os
-import copy
-import torch
-import pandas as pd
-from typing import Any, Dict, Optional
+from __future__ import annotations  # 允许注解中使用尚未定义的类名
+import os                           # 操作系统接口：路径与目录操作
+import copy                         # 标准库：对象深拷贝
+import torch                        # PyTorch：模型权重保存/加载
+import pandas as pd                 # 数据分析库：DataFrame 与 CSV 操作
+from typing import Any, Dict, Optional  # 类型注解工具
 
 
 def ensure_dir(path: str) -> str:
@@ -17,8 +17,8 @@ def ensure_dir(path: str) -> str:
     返回：
       原始路径（方便链式调用：out = ensure_dir(os.path.join(root, subdir))）
     """
-    os.makedirs(path, exist_ok=True)
-    return path
+    os.makedirs(path, exist_ok=True)  # 递归创建目录；exist_ok=True 表示目录已存在时不报错
+    return path                        # 返回原路径，方便链式调用
 
 
 def save_csv(data: Any, path: str) -> None:
@@ -33,11 +33,11 @@ def save_csv(data: Any, path: str) -> None:
       data : 要保存的数据
       path : CSV 文件路径
     """
-    ensure_dir(os.path.dirname(path) or ".")
+    ensure_dir(os.path.dirname(path) or ".")  # 确保父目录存在（path 若无目录部分则用当前目录）
     if isinstance(data, pd.DataFrame):
-        data.to_csv(path, index=False)
+        data.to_csv(path, index=False)         # DataFrame 直接保存，不写行索引
     else:
-        pd.DataFrame(data).to_csv(path, index=False)
+        pd.DataFrame(data).to_csv(path, index=False)  # 先转 DataFrame 再保存
 
 
 def save_model(model: torch.nn.Module, path: str) -> None:
@@ -51,8 +51,8 @@ def save_model(model: torch.nn.Module, path: str) -> None:
       model : PyTorch 模型
       path  : 保存路径（推荐以 .pt 结尾）
     """
-    ensure_dir(os.path.dirname(path) or ".")
-    torch.save(model.state_dict(), path)
+    ensure_dir(os.path.dirname(path) or ".")      # 确保父目录存在
+    torch.save(model.state_dict(), path)           # 将权重字典序列化到文件
 
 
 def load_model(model: torch.nn.Module, path: str, strict: bool = False) -> torch.nn.Module:
@@ -68,9 +68,9 @@ def load_model(model: torch.nn.Module, path: str, strict: bool = False) -> torch
     返回：
       加载权重后的模型
     """
-    state = torch.load(path, map_location="cpu")   # 先加载到 CPU，由模型 .to(device) 移动
-    model.load_state_dict(state, strict=strict)
-    return model
+    state = torch.load(path, map_location="cpu")   # 先加载到 CPU，避免 GPU OOM；后由模型 .to(device) 移动
+    model.load_state_dict(state, strict=strict)     # 将权重写入模型（strict=False 允许部分匹配）
+    return model                                     # 返回模型本身，方便链式调用
 
 
 def copy_model_state(model: torch.nn.Module) -> dict:
@@ -83,7 +83,7 @@ def copy_model_state(model: torch.nn.Module) -> dict:
     返回：
       state_dict 的深拷贝字典
     """
-    return copy.deepcopy(model.state_dict())
+    return copy.deepcopy(model.state_dict())  # 深拷贝：新字典与原权重完全独立，修改互不影响
 
 
 def restore_model_state(model: torch.nn.Module, state: dict) -> None:
@@ -96,4 +96,4 @@ def restore_model_state(model: torch.nn.Module, state: dict) -> None:
       model : 目标模型（in-place 修改）
       state : 之前通过 copy_model_state 保存的状态字典
     """
-    model.load_state_dict(state)
+    model.load_state_dict(state)  # 严格加载（不允许键缺失），完全用 state 覆盖当前权重

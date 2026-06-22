@@ -16,56 +16,84 @@ M4Fed 敏感性分析（Sensitivity Analysis）。
 
 每个配置点均运行完整的 M4Fed 协议，汇总结果保存为 CSV。
 """
-from __future__ import annotations
-import os, sys, copy
-import numpy as np
-import pandas as pd
+from __future__ import annotations    # 允许注解中使用尚未定义的类名
+import os, sys, copy                  # os：路径；sys：路径修改；copy：深拷贝
+import numpy as np                    # NumPy（随机划分、Dirichlet 采样）
+import pandas as pd                   # Pandas（汇总表格）
 
-# 将项目根目录加入路径（使实验脚本可以直接运行）
+# 将项目根目录加入 Python 路径（使实验脚本可以直接运行）
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from configs import load_config
-from utils.seed_utils import set_seed
-from utils.io_utils import ensure_dir, save_csv
-from data.openmind_dataset import build_node_datasets, OpenMindDataset
-from federated.server import Server
-from federated.client import Client
-from federated.methods import run_m4fed
-from evaluation.visualization import plot_loss_curves
+from configs import load_config                   # 加载 YAML 配置文件
+from utils.seed_utils import set_seed             # 随机种子设置（保证可复现）
+from utils.io_utils import ensure_dir, save_csv   # 目录创建和 CSV 保存
+from data.openmind_dataset import build_node_datasets, OpenMindDataset, make_openmind_sample_loader
+# build_node_datasets : 构建服务器/客户端数据集字典
+# OpenMindDataset     : 数据集类（用于访问 .samples 属性）
+# make_openmind_sample_loader : 创建 HuggingFace 样本加载函数
+from federated.server import Server               # 服务器节点
+from federated.client import Client               # 客户端节点
+from federated.methods import run_m4fed           # M4Fed 完整协议
+from evaluation.visualization import plot_loss_curves   # 损失曲线绘图（用于可视化扫描对比）
 
 
 def _build(cfg, node_datasets, device):
     """
-    快速构建服务器和客户端（2 个客户端）。
+    快速构建服务器和 2 个客户端参与者对象（敏感性分析的辅助函数）。
 
     参数：
-      cfg          : 当前扫描点的配置（已深拷贝）
-      node_datasets: 节点数据集字典
-      device       : 计算设备
+      cfg          : 当前扫描点的配置（已深拷贝，已修改目标超参数）
+      node_datasets: 节点数据集字典（由 build_node_datasets 返回）
+      device       : 计算设备（"cuda" 或 "cpu"）
+
+    返回：
+      (server, clients) 元组，clients 是长度为 2 的列表
     """
+    # 初始化服务器（含公开数据 server_public 和私有数据 server_private）
     server = Server(cfg, node_datasets["server_private"],
                     node_datasets["server_public"], device)
+    # 初始化 2 个客户端（client_0 和 client_1，只含私有数据）
     clients = [Client(i, cfg, node_datasets[f"client_{i}"], device)
                for i in range(2)]
-    return server, clients
+    return server, clients   # 返回参与者元组
 
 
 def _base_datasets(cfg, all_ds_ids, mri_shape, dummy, n_dummy_per_ds=2):
     """
-    构建基础节点数据集（所有扫描点共用相同的初始划分）。
+    构建基础节点数据集（作为敏感性分析各扫描点的共同起点）。
 
-    参数与 build_node_datasets 一致，n_clients 固定为 2（服务器 + 2 个客户端）。
+    各扫描点通过深拷贝（copy.deepcopy）此数据集后修改，避免扫描点之间数据相互污染。
+    dummy=False 时从 HuggingFace 下载真实 OpenMind 样本（NIfTI + 元数据）。
+
+    参数：
+      cfg           : M4FedConfig（用于读取 hf_dataset_id、cache_dir 等数据参数）
+      all_ds_ids    : 所有可用的子数据集 ID 列表
+      mri_shape     : MRI 体积目标分辨率（元组）
+      dummy         : 是否虚拟模式（True 时跳过真实数据下载，生成随机张量）
+      n_dummy_per_ds: 虚拟模式下每个数据集生成的样本数（默认 2）
+
+    返回：
+      node_datasets 字典（keys: "server_private", "server_public", "client_0", "client_1"）
     """
+    # 非虚拟模式：创建 HuggingFace 样本加载函数（下载 NIfTI + CSV 元数据）
+    sample_loader_fn = None if dummy else make_openmind_sample_loader(
+        cfg.data.hf_dataset_id,                 # HuggingFace 数据集仓库 ID
+        cache_dir=cfg.data.cache_dir or None,   # 本地缓存目录（None 用默认缓存）
+        max_cache_gb=cfg.data.max_cache_gb,     # 最大缓存容量（GB）
+    )
+    # 构建节点数据集（服务器 + 2 客户端；n_clients=2 固定）
     return build_node_datasets(
-        all_ds_ids=all_ds_ids,
-        n_cross=cfg.data.n_cross_ds,
-        n_private_per_node=cfg.data.n_private_ds_per_node,
-        n_clients=2,
-        train_split=cfg.data.train_split,
-        mri_shape=mri_shape,
-        seed=cfg.data.seed,
-        dummy_mode=dummy,
-        n_dummy_per_ds=n_dummy_per_ds,
+        all_ds_ids=all_ds_ids,                              # 所有数据集 ID
+        n_cross=cfg.data.n_cross_ds,                         # 公开数据集数量
+        n_private_per_node=cfg.data.n_private_ds_per_node,  # 每节点私有数据集数量
+        n_clients=2,                                         # 敏感性分析固定 2 客户端
+        train_split=cfg.data.train_split,                    # 训练/测试划分比例
+        mri_shape=mri_shape,                                 # MRI 目标分辨率
+        seed=cfg.data.seed,                                  # 数据划分随机种子
+        sample_loader_fn=sample_loader_fn,                   # 样本加载函数
+        dummy_mode=dummy,                                    # 是否虚拟模式
+        n_dummy_per_ds=n_dummy_per_ds,                      # 虚拟样本数/数据集
+        n_public_max=cfg.data.n_public_ds_max,              # 公开数据集上限
     )
 
 
@@ -73,149 +101,179 @@ def dirichlet_resplit(node_datasets: dict, alpha: float, seed: int) -> dict:
     """
     按 Dirichlet(α) 分布重新划分各节点的私有训练数据，模拟 Non-IID 场景。
 
+    Dirichlet 分布原理：
+      Dir([α, α, α]) 采样出三节点的数据比例向量 [p0, p1, p2]（p0+p1+p2=1）。
+      - α 越小（如 0.1）：比例向量极端化（一节点获得绝大多数数据），Non-IID 程度高
+      - α 越大（如 1.0）：比例向量趋于均匀（[1/3, 1/3, 1/3]），趋向 IID
+
     算法步骤：
-      1. 收集所有节点（server_private + client_0 + client_1）的训练样本
+      1. 收集所有节点（server_private + client_0 + client_1）的训练样本（汇总池）
       2. 用 np.random.dirichlet([α, α, α]) 采样三节点的数据比例
-      3. 对全量样本随机打乱并按比例切分
-      4. 将切分结果重新赋值给各节点的 .samples 属性（原地修改）
+      3. 将比例乘以样本总量得到各节点分配数量（累积边界）
+      4. 随机打乱样本索引后按累积边界切分
+      5. 将切分结果回写到各节点 .samples 属性（原地修改）
 
     参数：
-      node_datasets : build_node_datasets 返回的数据集字典
+      node_datasets : build_node_datasets 返回的数据集字典（原地修改）
       alpha         : Dirichlet 浓度参数（越小越 Non-IID）
-      seed          : 随机种子，确保可复现
+      seed          : 随机种子（确保不同扫描点之间可复现）
 
     返回：
-      重新划分后的 node_datasets（原地修改并返回）
+      重新划分后的 node_datasets（原地修改并返回，便于链式调用）
     """
-    rng = np.random.RandomState(seed)
+    rng = np.random.RandomState(seed)   # 创建独立随机状态（不影响全局种子）
+    # 确定参与重划分的节点键名（服务器私有 + 2 客户端私有）
     nodes = ["server_private"] + [f"client_{i}" for i in range(2)]
 
-    # 汇总所有节点的训练样本
+    # 第一步：汇总所有节点的训练样本（仅从 train 集取，test 集不重划）
     all_samples = []
     for node_key in nodes:
-        ds = node_datasets[node_key]["train"]
+        ds = node_datasets[node_key]["train"]   # 获取该节点的训练数据集
         if hasattr(ds, "samples"):
-            all_samples.extend(ds.samples)
+            all_samples.extend(ds.samples)       # 将该节点所有样本加入汇总池
 
-    n = len(all_samples)
+    n = len(all_samples)         # 总样本数
     if n == 0:
-        return node_datasets  # 空数据集，直接返回（避免除零错误）
+        return node_datasets     # 空数据集时直接返回（避免除零错误）
 
-    # Dirichlet 采样各节点的数据比例
-    proportions = rng.dirichlet([alpha] * len(nodes))
-    # 将比例转换为整数边界（累积和）
-    boundaries = (np.cumsum(proportions) * n).astype(int)
-    # 随机打乱所有样本索引（确保各节点收到的数据不带偏序）
-    indices = rng.permutation(n)
-    starts = [0] + list(boundaries[:-1])
+    # 第二步：Dirichlet 采样各节点的数据比例
+    proportions = rng.dirichlet([alpha] * len(nodes))   # 形状 (3,)，和为 1
 
-    # 按边界切分并重新赋值
+    # 第三步：将比例转换为整数边界（累积和后取整，最后一节点取剩余样本）
+    boundaries = (np.cumsum(proportions) * n).astype(int)  # [end_0, end_1, end_2]
+    boundaries[-1] = n   # 确保最后边界恰好等于总样本数（避免浮点取整丢失样本）
+
+    # 第四步：随机打乱所有样本索引（确保各节点收到的数据无偏序）
+    indices = rng.permutation(n)   # 生成 [0, n) 的随机排列
+    starts = [0] + list(boundaries[:-1])   # 各节点起始索引（[0, end_0, end_1]）
+
+    # 第五步：按边界切分并回写各节点 .samples 属性
     for i, node_key in enumerate(nodes):
-        node_idxs = indices[starts[i]:boundaries[i]]
-        new_samples = [all_samples[j] for j in node_idxs]
-        ds = node_datasets[node_key]["train"]
+        node_idxs = indices[starts[i]:boundaries[i]]     # 该节点分到的样本索引
+        new_samples = [all_samples[j] for j in node_idxs]  # 按索引取出样本
+        ds = node_datasets[node_key]["train"]              # 目标训练数据集
         if hasattr(ds, "samples"):
-            ds.samples = new_samples
+            ds.samples = new_samples   # 原地替换样本列表（实现 Non-IID 重划分）
 
-    return node_datasets
+    return node_datasets   # 返回修改后的数据集字典
 
 
 def run_sensitivity(args, cfg, all_ds_ids, mri_shape, task_specs, results_dir):
     """
-    运行三组敏感性分析并汇总结果。
+    运行三组敏感性分析（合成比例 / MedMD 学习率 / Dirichlet α）并汇总结果。
+
+    每次只改变一个超参数，其余保持 cfg 的默认值（控制变量法）。
+    每个扫描点均独立运行完整的 M4Fed 三阶段协议。
 
     参数：
-      args       : 命令行参数（.dummy 标志等）
-      cfg        : 基础 M4FedConfig
-      all_ds_ids : 子数据集 ID 列表
-      mri_shape  : MRI 体积目标尺寸
-      task_specs : 任务规格字典
+      args       : 命令行参数（.dummy 等标志）
+      cfg        : 基础 M4FedConfig（所有扫描点的起点，不直接修改）
+      all_ds_ids : 所有可用子数据集 ID 列表
+      mri_shape  : MRI 体积目标尺寸（元组）
+      task_specs : 任务规格字典（如 {"age": {"type": "regression", "n_classes": 1}}）
       results_dir: 结果保存根目录
 
     返回：
-      all_sensitivity_results 字典（键为扫描点标签，值为 {param, value, MAE, RMSE, ...}）
+      all_sensitivity_results 字典（键为扫描点标签，值为含 param/value/MAE 等字段的字典）
     """
-    sens_out = ensure_dir(os.path.join(results_dir, "sensitivity"))
-    device = cfg.training.device
-    dummy = args.dummy
-    # 构建基础数据集（各扫描点深拷贝，避免相互污染）
+    sens_out = ensure_dir(os.path.join(results_dir, "sensitivity"))  # 创建敏感性分析结果目录
+    device = cfg.training.device   # 计算设备
+    dummy = args.dummy             # 虚拟模式标志
+
+    # 构建基础节点数据集（各扫描点深拷贝此数据集，避免相互污染）
     nd_base = _base_datasets(cfg, all_ds_ids, mri_shape, dummy)
 
-    all_sensitivity_results = {}
+    all_sensitivity_results = {}   # 收集所有扫描点的结果
 
-    # ================================================================ #
-    # 扫描 1：合成数据比例（synth_ratio）                                  #
-    # ================================================================ #
-    for ratio in [0.1, 1.0, 10.0]:
-        tag = f"synth_ratio_{ratio}"
+    # ==================================================================
+    # 扫描 1：合成数据比例（synth_ratio）
+    # 同时修改联邦循环阶段（synth_ratio_fed）和本地训练阶段（synth_ratio_local）
+    # synth_ratio = 合成样本数 / 真实样本数（比值越大，合成数据影响越强）
+    # ==================================================================
+    for ratio in [0.1, 1.0, 10.0]:   # 三个扫描点
+        tag = f"synth_ratio_{ratio}"  # 扫描点标签（用作目录名和结果键名）
         print(f"[敏感性] 合成比例 synth_ratio = {ratio}")
-        set_seed(cfg.training.seed)
-        cfg_r = copy.deepcopy(cfg)
-        cfg_r.federated.synth_ratio_fed = ratio    # 联邦循环阶段的合成比例
-        cfg_r.federated.synth_ratio_local = ratio  # 本地训练阶段的合成比例
-        nd = copy.deepcopy(nd_base)
-        s, c = _build(cfg_r, nd, device)
+        set_seed(cfg.training.seed)     # 重置随机种子（每个扫描点独立初始化）
+        cfg_r = copy.deepcopy(cfg)      # 深拷贝配置（避免修改原始配置）
+        cfg_r.federated.synth_ratio_fed = ratio    # 修改：联邦循环合成比例
+        cfg_r.federated.synth_ratio_local = ratio  # 修改：本地训练合成比例
+        nd = copy.deepcopy(nd_base)    # 深拷贝数据集（保证各扫描点数据独立）
+        s, c = _build(cfg_r, nd, device)   # 构建参与者
+        # 运行完整 M4Fed 协议，结果保存到扫描点专属子目录
         res = run_m4fed(s, c, cfg_r, task_specs,
                         os.path.join(sens_out, tag))
+        # 将扫描点信息和客户端均值指标合并到结果字典
         all_sensitivity_results[tag] = {
-            "param": "synth_ratio", "value": ratio,
-            **res.get("clients_mean", {}),   # 展开 MAE/RMSE/Pearson_r/R2
+            "param": "synth_ratio",    # 被扫描的超参数名
+            "value": ratio,            # 当前扫描点的超参数值
+            **res.get("clients_mean", {}),   # 展开 MAE/RMSE/Pearson_r/R2（跨客户端均值）
         }
 
-    # ================================================================ #
-    # 扫描 2：MedMD 学习率（lr_medmd）                                    #
-    # ================================================================ #
-    for lr in [1e-5, 1e-4, 1e-3]:
-        tag = f"lr_{lr:.0e}"
+    # ==================================================================
+    # 扫描 2：MedMD 学习率（lr_medmd）
+    # 控制扩散模型 U-Net 的训练速度：学习率过大→不稳定，过小→收敛慢
+    # ==================================================================
+    for lr in [1e-5, 1e-4, 1e-3]:   # 三个数量级
+        tag = f"lr_{lr:.0e}"          # 标签格式如 "lr_1e-05"
         print(f"[敏感性] 学习率 lr_medmd = {lr}")
-        set_seed(cfg.training.seed)
-        cfg_l = copy.deepcopy(cfg)
-        cfg_l.training.lr_medmd = lr
-        nd = copy.deepcopy(nd_base)
-        s, c = _build(cfg_l, nd, device)
+        set_seed(cfg.training.seed)    # 重置随机种子
+        cfg_l = copy.deepcopy(cfg)     # 深拷贝配置
+        cfg_l.training.lr_medmd = lr  # 修改：MedMD 扩散模型学习率
+        nd = copy.deepcopy(nd_base)   # 深拷贝数据集
+        s, c = _build(cfg_l, nd, device)   # 构建参与者
         res = run_m4fed(s, c, cfg_l, task_specs,
                         os.path.join(sens_out, tag))
         all_sensitivity_results[tag] = {
-            "param": "lr_medmd", "value": lr,
-            **res.get("clients_mean", {}),
+            "param": "lr_medmd",   # 被扫描的超参数名
+            "value": lr,           # 当前学习率值
+            **res.get("clients_mean", {}),   # 展开均值指标
         }
 
-    # ================================================================ #
-    # 扫描 3：数据异质性（Dirichlet α）                                   #
-    # ================================================================ #
-    for alpha in [0.1, 0.5, 1.0]:
-        tag = f"dirichlet_alpha_{alpha}"
+    # ==================================================================
+    # 扫描 3：数据异质性（Dirichlet α）
+    # 通过 dirichlet_resplit 重新划分各节点私有数据，模拟不同 Non-IID 程度
+    # α=0.1：极端 Non-IID（某节点几乎独占所有数据）
+    # α=1.0：接近 IID（各节点数据量近似均等）
+    # ==================================================================
+    for alpha in [0.1, 0.5, 1.0]:   # 三个 Dirichlet 浓度参数
+        tag = f"dirichlet_alpha_{alpha}"   # 标签格式如 "dirichlet_alpha_0.1"
         print(f"[敏感性] 数据异质性 Dirichlet α = {alpha}")
-        set_seed(cfg.training.seed)
-        cfg_d = copy.deepcopy(cfg)
-        # 重新按 Dirichlet 分布划分各节点私有数据
+        set_seed(cfg.training.seed)     # 重置随机种子（保证 M4Fed 训练可复现）
+        cfg_d = copy.deepcopy(cfg)      # 深拷贝配置（α 不改变模型配置）
+        # 深拷贝数据集后按 Dirichlet(α) 重新划分各节点私有训练数据
         nd = dirichlet_resplit(copy.deepcopy(nd_base), alpha=alpha,
-                               seed=cfg.training.seed)
-        s, c = _build(cfg_d, nd, device)
+                               seed=cfg.training.seed)  # 使用与 M4Fed 相同的种子
+        s, c = _build(cfg_d, nd, device)   # 构建参与者（使用重划分后的数据集）
         res = run_m4fed(s, c, cfg_d, task_specs,
                         os.path.join(sens_out, tag))
         all_sensitivity_results[tag] = {
-            "param": "dirichlet_alpha", "value": alpha,
-            **res.get("clients_mean", {}),
+            "param": "dirichlet_alpha",   # 被扫描的超参数名
+            "value": alpha,               # 当前 Dirichlet α 值
+            **res.get("clients_mean", {}),   # 展开均值指标
         }
 
-    # ---- 汇总保存 ----
+    # ------------------------------------------------------------------
+    # 汇总并保存结果（CSV 表格）
+    # ------------------------------------------------------------------
+    # 将所有扫描点结果转为 DataFrame（行为扫描点，列为 param/value/MAE/RMSE 等）
     summary_df = pd.DataFrame(list(all_sensitivity_results.values()))
-    summary_df.insert(0, "tag", list(all_sensitivity_results.keys()))
-    save_csv(summary_df, os.path.join(sens_out, "sensitivity_summary.csv"))
+    summary_df.insert(0, "tag", list(all_sensitivity_results.keys()))  # 插入标签列
+    save_csv(summary_df, os.path.join(sens_out, "sensitivity_summary.csv"))   # 保存 CSV
     print("[敏感性] 结果已保存至", sens_out)
-    return all_sensitivity_results
+    return all_sensitivity_results   # 返回完整敏感性分析结果字典
 
 
 if __name__ == "__main__":
-    import argparse
+    import argparse   # 命令行参数解析
     p = argparse.ArgumentParser()
-    p.add_argument("--config", default="configs/m4fed.yaml")
-    p.add_argument("--dummy", action="store_true", help="使用虚拟数据快速验证")
-    p.add_argument("--results_dir", default="results")
-    args = p.parse_args()
-    cfg = load_config(args.config)
+    p.add_argument("--config", default="configs/m4fed.yaml")         # 配置文件路径
+    p.add_argument("--dummy", action="store_true", help="使用虚拟数据快速验证")  # 虚拟模式
+    p.add_argument("--results_dir", default="results")                # 结果保存目录
+    args = p.parse_args()   # 解析命令行参数
+    cfg = load_config(args.config)   # 加载 M4FedConfig 配置
+    # 虚拟模式：生成 100 个假 ID；正式模式：从 HuggingFace 枚举真实 ID
     all_ds_ids = [f"ds{i:06d}" for i in range(100)] if args.dummy else []
+    # 虚拟模式用 16³ 分辨率（快速验证），正式模式用配置中的分辨率
     mri_shape = (16, 16, 16) if args.dummy else tuple(cfg.data.mri_shape)
-    task_specs = {"age": {"type": "regression", "n_classes": 1}}
+    task_specs = {"age": {"type": "regression", "n_classes": 1}}   # 仅评估年龄回归任务
     run_sensitivity(args, cfg, all_ds_ids, mri_shape, task_specs, args.results_dir)

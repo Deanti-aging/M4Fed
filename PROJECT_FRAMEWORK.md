@@ -368,6 +368,85 @@ einops>=0.7
 | 依赖安装 | 需先按 `requirements.txt` 建立 conda/pip 环境；MONAI GenerativeModels 需从源码安装（`pip install git+https://github.com/Project-MONAI/GenerativeModels.git`） |
 | NeuroFM 加载 | `NeuroAI-UofG/NeuroFM` 需要 `trust_remote_code=True`；若模型结构与预期不符，自动退回 `_Backbone3DCNN` |
 | VAE 权重 | `katielink` 收藏中的具体 repo 名需确认；目前 `vae_repo` 默认值为占位符，实际使用需更新 `configs/m4fed.yaml` 中的 `vae_repo` 字段 |
-| HuggingFace streaming | OpenMind 数据集的字段名（`dataset_id` / `ds_id` 等）需与实际 schema 对齐，可能需调整 `openmind_dataset.py` 中的字段名 |
+| HuggingFace 真实数据接入 | `AnonRes/OpenMind` 是按 `dsXXXXXX/` 文件夹组织的原始 NIfTI 文件仓库（114k 文件，800 个子数据集），配一份 38MB 的 `openneuro_metadata.csv`（列：`unique_id, modality, image_quality_score, age, weight, bmi, sex, handedness, race, health_status, manufacturer, model_name, phase_encoding_direction, magnetic_field_strength, repetition_time, echo_time, is_brain_extract, derived_from, image_path, anat_mask_path, anon_mask_path`），没有 `train` split 也没有 `dataset_id`/`ds_id` 字段。已改为：`list_openmind_ds_ids()` 枚举仓库文件路径前缀得到 ds_id；`make_openmind_sample_loader()` 下载/解析 CSV、按 `modality=="T1w"` 筛选（42.7k/114k 行）并按 ds_id 分组，返回的 `sample_loader_fn` 已接入 `main.py`/`run_all_baselines.py`/`ablation.py`/`sensitivity.py`/`cross_site.py` 的所有 `build_node_datasets` 调用；NIfTI 文件本身在 `OpenMindDataset.__getitem__` 中惰性下载（`_resolve_hf_path`，命中 huggingface_hub 本地缓存） |
+| 表格字段命名 | `preprocessing._CONTINUOUS_FIELDS`/`_IGNORE_FIELDS` 与 `table_to_text._FIELD_TEMPLATES` 原先使用的是猜测的通用 BIDS 字段名（`BMI`、`participant_id`、`filename`），与真实 CSV 列名不一致（真实列是小写 `bmi`，且没有 `participant_id`/`filename` 列，却有大量扫描技术列如 `manufacturer`/`image_path` 需要排除）。已对齐为真实列名 |
 | FID/KID | 需要 `torch-fidelity`；样本数 <50 时 KID 会自动降低 `kid_subset_size` |
 | Python 环境 | 截至 2026-06-12 本机尚无 Python 环境，未能运行语法检查；安装环境后建议先执行 `python main.py --mode test` 验证 |
+
+---
+
+## 11. OpenNeuro 数据集统计（openneuro_metadata.csv）
+
+> **数据来源**：[AnonRes/OpenMind](https://huggingface.co/datasets/AnonRes/OpenMind) `openneuro_metadata.csv`  
+> **统计日期**：2026-06-17  
+> **预处理规则**：`preprocess_table()` 将 `n/a`、`N/A`、`NA`、`nan`、空字符串统一视为缺失值；
+> 受试者标识从 `image_path`（BIDS 格式 `dsXXXXXX/sub-YY/anat/...`）提取前两段（`ds_id/sub-id`）跨数据集去重。
+
+### 11.1 总体概况
+
+| 统计项 | 数量 |
+|--------|-----:|
+| CSV 总行数（扫描条目） | 113,921 |
+| 唯一受试者数（ds\_id/sub-id 去重） | 34,139 |
+
+### 11.2 受试者级统计（ds\_id/sub-id 去重）
+
+| 统计项 | 受试者数 |
+|--------|--------:|
+| 总受试者数 | 34,139 |
+| **age 字段非空**的受试者数 | 20,951 |
+| **age 和 sex 字段均非空**的受试者数 | 20,140 |
+| **age 和 health\_status 字段均非空**的受试者数 | 6,372 |
+
+### 11.3 扫描条目级统计（每行 = 一个 NIfTI 文件）
+
+| 统计项 | 扫描条目数 |
+|--------|----------:|
+| 总扫描条目数 | 113,921 |
+| **age 字段非空**的扫描条目数 | 79,761 |
+| **age 和 sex 字段均非空**的扫描条目数 | 77,612 |
+| **age 和 health\_status 字段均非空**的扫描条目数 | 25,256 |
+
+### 11.4 模态分布（全量）
+
+| 模态 | 扫描条目数 |
+|------|----------:|
+| T1w | 42,732 |
+| T2w | 22,999 |
+| MD（Mean Diffusivity） | 13,407 |
+| FA（Fractional Anisotropy） | 13,407 |
+| FLAIR | 5,583 |
+| MP2RAGE | 2,859 |
+| sbref | 1,795 |
+| DWI（b0 image） | 55 |
+| ADC | 1,757 |
+| TRACE | 1,715 |
+| UNIT1 | 927 |
+| inplaneT2 | 892 |
+| SWI | 784 |
+| UNIT1\_denoised | 724 |
+| T1map | 557 |
+| inplaneT1 | 529 |
+| PDw | 473 |
+| angio | 488 |
+| T2starw | 409 |
+| FLASH | 307 |
+| PET | 653 |
+| minIP | 687 |
+| T2map | 106 |
+| T2starmap | 76 |
+
+### 11.5 T1w 结构像专项（M4Fed 实际使用的模态）
+
+| 统计项 | 数量 |
+|--------|-----:|
+| T1w 扫描条目总数 | 42,732 |
+| T1w 中 **age 非空**的扫描条目数（可纳入训练） | 26,408 |
+| T1w 中 **age 非空**的唯一受试者数 | 20,107 |
+
+### 11.6 训练过滤说明
+
+M4Fed 的 domain task 为脑龄预测，`_sample_loader_fn`（`data/openmind_dataset.py`）在构建样本列表时跳过 `age` 字段为空的行：
+
+- 这些受试者**不进入任何样本列表**，对应的 NIfTI 文件**不会被下载**，节省磁盘和网络开销。
+- 实际可用训练样本数还受 `n_cross_ds`、`n_private_ds_per_node`、`n_public_ds_max` 等配置参数对子数据集的进一步划分限制。

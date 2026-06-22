@@ -16,41 +16,43 @@
 用法：
   python experiments/run_all_baselines.py --config configs/m4fed.yaml [--dummy]
 """
-from __future__ import annotations
-import argparse
-import os
-import sys
-import copy
-import numpy as np
-import pandas as pd
+from __future__ import annotations    # 允许注解中使用尚未定义的类名
+import argparse                        # 命令行参数解析
+import os                              # 路径操作
+import sys                             # 系统路径修改
+import copy                            # 深拷贝（为各方法复制配置对象）
+import numpy as np                     # NumPy（统计计算）
+import pandas as pd                    # Pandas（汇总表格保存）
 
-# 将项目根目录加入路径（使实验脚本可以直接运行）
+# 将项目根目录加入 Python 路径（使实验脚本可以直接运行，不依赖 package install）
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from configs import load_config
-from utils.seed_utils import set_seed
-from utils.io_utils import ensure_dir, save_csv
-from data.openmind_dataset import build_node_datasets
-from data.splits import assign_ds_splits
-from federated.server import Server
-from federated.client import Client
-from federated.methods import run_m4fed, run_fedavg, run_fedprox, run_fan, run_gptfl
-from evaluation.visualization import (
+from configs import load_config           # 加载 YAML 配置文件
+from utils.seed_utils import set_seed     # 随机种子设置（保证可复现）
+from utils.io_utils import ensure_dir, save_csv  # 目录创建和 CSV 保存
+from data.openmind_dataset import (       # 数据集构建工具
+    build_node_datasets, list_openmind_ds_ids, make_openmind_sample_loader
+)
+from data.splits import assign_ds_splits  # 数据集划分辅助函数
+from federated.server import Server       # 服务器节点
+from federated.client import Client       # 客户端节点
+from federated.methods import run_m4fed, run_fedavg, run_fedprox, run_fan, run_gptfl  # 5 个方法
+from evaluation.visualization import (    # 可视化函数
     plot_loss_curves, plot_metric_bars, save_figure,
     plot_scatter, plot_age_bin_mae, plot_residuals, plot_error_heatmap,
     save_all_bias_figures,
 )
-from evaluation.metrics import compute_domain_metrics, compute_bias_analysis
+from evaluation.metrics import compute_domain_metrics, compute_bias_analysis   # 评估指标函数
 
 
 def parse_args():
-    """解析命令行参数。"""
-    p = argparse.ArgumentParser()
-    p.add_argument("--config", default="configs/m4fed.yaml")
+    """解析命令行参数：配置文件路径、是否虚拟模式、结果保存目录。"""
+    p = argparse.ArgumentParser()   # 创建参数解析器
+    p.add_argument("--config", default="configs/m4fed.yaml")   # 配置文件路径（默认 m4fed.yaml）
     p.add_argument("--dummy", action="store_true",
-                   help="使用极小虚拟数据进行冒烟测试（秒级完成）")
-    p.add_argument("--results_dir", default="results")
-    return p.parse_args()
+                   help="使用极小虚拟数据进行冒烟测试（秒级完成）")  # 快速冒烟测试模式
+    p.add_argument("--results_dir", default="results")   # 结果保存根目录
+    return p.parse_args()   # 解析并返回参数命名空间
 
 
 def build_participants(cfg, node_datasets: dict, device: str, n_clients: int):
@@ -58,213 +60,241 @@ def build_participants(cfg, node_datasets: dict, device: str, n_clients: int):
     从预构建的节点数据集字典实例化 Server 和 Client 对象。
 
     参数：
-      cfg          : 当前方法的配置对象
+      cfg          : 当前方法的配置对象（M4FedConfig）
       node_datasets: build_node_datasets 返回的节点数据集字典
       device       : 计算设备（'cuda' 或 'cpu'）
-      n_clients    : 客户端数量
+      n_clients    : 客户端数量（M4Fed 为 2，其他基线为 3）
 
     返回：
       (server, clients) 元组
+        - server  : Server 实例（含公开数据和私有数据）
+        - clients : Client 实例列表（长度 = n_clients）
     """
+    # 初始化服务器（公开数据 + 私有数据）
     server = Server(
-        cfg=cfg,
-        private_datasets=node_datasets["server_private"],
-        public_datasets=node_datasets["server_public"],
-        device=device,
+        cfg=cfg,                                               # 全局配置
+        private_datasets=node_datasets["server_private"],      # 服务器私有数据集字典
+        public_datasets=node_datasets["server_public"],        # 服务器公开数据集字典
+        device=device,                                         # 计算设备
     )
+    # 初始化各客户端（私有数据）
     clients = [
         Client(
-            client_id=i,
-            cfg=cfg,
-            private_datasets=node_datasets[f"client_{i}"],
-            device=device,
+            client_id=i,                                       # 客户端编号（0-indexed）
+            cfg=cfg,                                           # 全局配置
+            private_datasets=node_datasets[f"client_{i}"],    # 第 i 个客户端的私有数据集
+            device=device,                                     # 计算设备
         )
-        for i in range(n_clients)
+        for i in range(n_clients)   # 创建 n_clients 个客户端
     ]
-    return server, clients
+    return server, clients   # 返回服务器和客户端列表
 
 
 def default_task_specs():
     """
-    返回默认任务规格字典。
+    返回默认任务规格字典（NeuroFM 多任务预测配置）。
 
     包含两个任务：
-      age：回归任务，输出维度 1
-      sex：分类任务，类别数 2（男/女）
+      age：回归任务，输出维度 1（直接预测年龄值）
+      sex：分类任务，类别数 2（0=男，1=女）
+
+    返回：
+      任务规格字典（{task_name: {type: ..., n_classes: ...}}）
     """
     return {
-        "age": {"type": "regression", "n_classes": 1},
-        "sex": {"type": "classification", "n_classes": 2},
+        "age": {"type": "regression", "n_classes": 1},       # 年龄回归（主任务）
+        "sex": {"type": "classification", "n_classes": 2},   # 性别分类（辅助任务）
     }
 
 
 def main():
-    """主函数：顺序运行 5 个方法并汇总对比结果。"""
-    args = parse_args()
-    cfg = load_config(args.config)
-    set_seed(cfg.training.seed)
+    """主函数：解析参数 → 构建数据集 → 顺序运行 5 个方法 → 汇总结果并绘图。"""
+    args = parse_args()           # 解析命令行参数
+    cfg = load_config(args.config)  # 加载配置文件
+    set_seed(cfg.training.seed)    # 设置全局随机种子（保证可复现）
 
-    device = cfg.training.device
-    # 若 CUDA 不可用但配置要求 CUDA，自动降级到 CPU
+    device = cfg.training.device   # 从配置读取计算设备
+    # 若 CUDA 不可用但配置要求使用 CUDA，自动降级到 CPU（避免崩溃）
     if not _cuda_available() and device == "cuda":
-        device = "cpu"
-        cfg.training.device = "cpu"
+        device = "cpu"             # 降级到 CPU
+        cfg.training.device = "cpu"   # 同步更新配置
         print("[run_all] CUDA 不可用，已切换至 CPU。")
 
-    results_dir = ensure_dir(args.results_dir)
-    task_specs = default_task_specs()
+    results_dir = ensure_dir(args.results_dir)   # 创建并返回结果根目录
+    task_specs = default_task_specs()             # 获取默认任务规格
 
     # ------------------------------------------------------------------ #
     # 数据集准备                                                            #
     # ------------------------------------------------------------------ #
     if args.dummy:
-        # 虚拟模式：生成 100 个假 ID，MRI 尺寸缩小为 16³
-        all_ds_ids = [f"ds{i:06d}" for i in range(100)]
-        mri_shape = (16, 16, 16)
+        # 虚拟模式：生成 100 个假数据集 ID，MRI 尺寸缩小为 16³（秒级完成）
+        all_ds_ids = [f"ds{i:06d}" for i in range(100)]   # 假 ID 列表
+        mri_shape = (16, 16, 16)   # 极小分辨率（仅用于测试流程）
     else:
-        # 正式模式：从 HuggingFace OpenMind 流式加载数据集 ID
-        all_ds_ids = _load_openmind_ds_ids(cfg)
-        mri_shape = tuple(cfg.data.mri_shape)
+        # 正式模式：从 HuggingFace OpenMind 枚举真实数据集 ID
+        all_ds_ids = _load_openmind_ds_ids(cfg)   # 枚举 OpenMind 子数据集 ID
+        mri_shape = tuple(cfg.data.mri_shape)      # 从配置读取目标分辨率
 
-    # 构建 M4Fed 专用划分（服务器 + 2 个客户端）
-    node_datasets = build_node_datasets(
-        all_ds_ids=all_ds_ids,
-        n_cross=cfg.data.n_cross_ds,
-        n_private_per_node=cfg.data.n_private_ds_per_node,
-        n_clients=cfg.data.n_clients if hasattr(cfg.data, "n_clients") else 2,
-        train_split=cfg.data.train_split,
-        mri_shape=mri_shape,
-        seed=cfg.data.seed,
-        dummy_mode=args.dummy,
-        n_dummy_per_ds=2 if args.dummy else 10,
+    # 构建样本加载函数（非 dummy 模式下从 HuggingFace 下载 NIfTI + 元数据）
+    sample_loader_fn = None if args.dummy else make_openmind_sample_loader(
+        cfg.data.hf_dataset_id,             # HuggingFace 数据集仓库 ID
+        cache_dir=cfg.data.cache_dir or None,  # 本地缓存目录（None=使用默认）
+        max_cache_gb=cfg.data.max_cache_gb,  # 最大缓存大小（GB，LRU 淘汰旧文件）
     )
 
-    # 构建 3 客户端划分（FedAvg/FedProx/FAN/GPT-FL 共用）
+    # 构建 M4Fed 专用划分（服务器公开+私有 + 2 个客户端私有）
+    node_datasets = build_node_datasets(
+        all_ds_ids=all_ds_ids,               # 所有可用数据集 ID 列表
+        n_cross=cfg.data.n_cross_ds,          # 公开数据集数量（服务器热身用）
+        n_private_per_node=cfg.data.n_private_ds_per_node,  # 每个节点的私有数据集数量
+        n_clients=cfg.data.n_clients if hasattr(cfg.data, "n_clients") else 2,  # M4Fed 用 2 客户端
+        train_split=cfg.data.train_split,     # 训练/测试划分比例
+        mri_shape=mri_shape,                  # MRI 目标分辨率
+        seed=cfg.data.seed,                   # 划分随机种子
+        sample_loader_fn=sample_loader_fn,    # 样本加载函数（dummy 时为 None）
+        dummy_mode=args.dummy,                # 是否虚拟模式
+        n_dummy_per_ds=2 if args.dummy else 10,  # 每个虚拟数据集的样本数
+        n_public_max=cfg.data.n_public_ds_max,  # 公开数据集最大数量限制
+    )
+
+    # 构建 3 客户端划分（FedAvg/FedProx/FAN/GPT-FL 共用同一划分）
     node_datasets_3 = build_node_datasets(
         all_ds_ids=all_ds_ids,
         n_cross=cfg.data.n_cross_ds,
         n_private_per_node=cfg.data.n_private_ds_per_node,
-        n_clients=3,
+        n_clients=3,                          # 3 客户端结构（其他基线使用）
         train_split=cfg.data.train_split,
         mri_shape=mri_shape,
         seed=cfg.data.seed,
+        sample_loader_fn=sample_loader_fn,
         dummy_mode=args.dummy,
         n_dummy_per_ds=2 if args.dummy else 10,
+        n_public_max=cfg.data.n_public_ds_max,
     )
 
     # ------------------------------------------------------------------ #
     # 依次运行各方法                                                        #
     # ------------------------------------------------------------------ #
-    all_results = {}
+    all_results = {}   # 收集所有方法的评估结果字典
 
-    # ---- M4Fed（本论文方法）----
+    # ---- M4Fed（本论文提出的方法）----
     print("\n======== M4Fed ========")
     server, clients = build_participants(cfg, node_datasets, device, n_clients=2)
-    set_seed(cfg.training.seed)
+    set_seed(cfg.training.seed)   # 每个方法前重置随机种子（保证公平对比）
     all_results["m4fed"] = run_m4fed(server, clients, cfg, task_specs, results_dir)
-    # 保存服务器 MedMD 路径供 GPT-FL 复用（GPT-FL 需要预训练好的生成模型）
+    # 保存服务器 MedMD 路径（供 GPT-FL 复用热身阶段训练好的生成模型）
     m4fed_medmd_path = os.path.join(results_dir, "m4fed", "server_medmd.pt")
 
-    # ---- FedAvg（联邦平均）----
+    # ---- FedAvg（联邦平均基线，McMahan et al., 2017）----
     print("\n======== FedAvg ========")
-    cfg_fa = copy.deepcopy(cfg)
-    cfg_fa.federated.method = "fedavg"
-    cfg_fa.federated.n_clients = 3
+    cfg_fa = copy.deepcopy(cfg)          # 深拷贝配置（避免修改影响后续方法）
+    cfg_fa.federated.method = "fedavg"   # 标记方法名
+    cfg_fa.federated.n_clients = 3       # FedAvg 使用 3 客户端
     server3, clients3 = build_participants(cfg_fa, node_datasets_3, device, n_clients=3)
-    set_seed(cfg.training.seed)
+    set_seed(cfg.training.seed)   # 重置随机种子
     all_results["fedavg"] = run_fedavg(server3, clients3, cfg_fa, task_specs, results_dir)
 
-    # ---- FedProx（联邦近端正则）----
+    # ---- FedProx（联邦近端正则，Li et al., 2020）----
     print("\n======== FedProx ========")
-    cfg_fp = copy.deepcopy(cfg)
-    cfg_fp.federated.method = "fedprox"
-    cfg_fp.federated.n_clients = 3
+    cfg_fp = copy.deepcopy(cfg)           # 深拷贝配置
+    cfg_fp.federated.method = "fedprox"   # 标记方法名
+    cfg_fp.federated.n_clients = 3        # FedProx 使用 3 客户端
     server3b, clients3b = build_participants(cfg_fp, node_datasets_3, device, n_clients=3)
-    set_seed(cfg.training.seed)
+    set_seed(cfg.training.seed)   # 重置随机种子
     all_results["fedprox"] = run_fedprox(server3b, clients3b, cfg_fp, task_specs, results_dir)
 
-    # ---- FAN（联邦增强网络）----
+    # ---- FAN（联邦增强网络，去中心化合成数据交换）----
     print("\n======== FAN ========")
-    cfg_fan = copy.deepcopy(cfg)
-    cfg_fan.federated.method = "fan"
-    cfg_fan.federated.n_clients = 3
+    cfg_fan = copy.deepcopy(cfg)          # 深拷贝配置
+    cfg_fan.federated.method = "fan"      # 标记方法名
+    cfg_fan.federated.n_clients = 3       # FAN 使用 3 客户端
     server3c, clients3c = build_participants(cfg_fan, node_datasets_3, device, n_clients=3)
-    set_seed(cfg.training.seed)
+    set_seed(cfg.training.seed)   # 重置随机种子
     all_results["fan"] = run_fan(server3c, clients3c, cfg_fan, task_specs, results_dir)
 
-    # ---- GPT-FL（服务器端文本生成基线）----
+    # ---- GPT-FL（服务器端文本条件生成，He et al., 2023）----
     print("\n======== GPT-FL ========")
-    cfg_gfl = copy.deepcopy(cfg)
-    cfg_gfl.federated.method = "gptfl"
-    cfg_gfl.federated.n_clients = 3
+    cfg_gfl = copy.deepcopy(cfg)           # 深拷贝配置
+    cfg_gfl.federated.method = "gptfl"     # 标记方法名
+    cfg_gfl.federated.n_clients = 3        # GPT-FL 使用 3 客户端
     server3d, clients3d = build_participants(cfg_gfl, node_datasets_3, device, n_clients=3)
-    set_seed(cfg.training.seed)
+    set_seed(cfg.training.seed)   # 重置随机种子
     all_results["gptfl"] = run_gptfl(
         server3d, clients3d, cfg_gfl, task_specs, results_dir,
-        pretrained_medmd_path=m4fed_medmd_path,  # 复用 M4Fed 预训练好的服务器 MedMD
+        pretrained_medmd_path=m4fed_medmd_path,   # 复用 M4Fed 热身阶段的服务器 MedMD
     )
 
     # ------------------------------------------------------------------ #
     # 汇总指标并生成对比图表                                                 #
     # ------------------------------------------------------------------ #
-    _save_summary_and_figures(all_results, results_dir, cfg)
+    _save_summary_and_figures(all_results, results_dir, cfg)   # 保存汇总 CSV 和柱状图
+
+    # 保存各阶段耗时分布（用于论文效率对比和计算资源分析）
+    from utils.timing_utils import save_timing_csv   # 局部导入（避免顶层循环依赖）
+    save_timing_csv(os.path.join(results_dir, "timing_breakdown.csv"))
+    print("[汇总] 耗时统计已保存至", os.path.join(results_dir, "timing_breakdown.csv"))
 
 
 def _save_summary_and_figures(all_results: dict, results_dir: str, cfg) -> None:
     """
     将所有方法的客户端均值指标汇总为 CSV，并生成各指标的柱状图。
 
-    参数：
-      all_results : {方法名: run_xxx() 的返回字典}
-      results_dir : 根结果目录
-      cfg         : 配置对象（读取 figure_format 和 palette）
-    """
-    fmt = cfg.eval.figure_format
-    palette = cfg.eval.palette
+    处理逻辑：
+      - 从每个方法的 "clients_mean" 和 "clients_std" 提取跨客户端均值和标准差
+      - M4Fed 的服务器端指标单独列出（标为 "M4Fed-server"）
+      - 为每个指标（MAE/RMSE/Pearson_r/R2）生成带误差棒的柱状图
 
-    # ---- 构造汇总表格 ----
-    summary_rows = []
+    参数：
+      all_results : {方法名: run_xxx() 的返回字典}（5 个方法的结果）
+      results_dir : 结果根目录（汇总文件保存在此）
+      cfg         : 配置对象（读取 eval.figure_format 和 eval.palette）
+    """
+    fmt = cfg.eval.figure_format   # 图表文件格式（"svg"、"pdf"、"png"）
+    palette = cfg.eval.palette     # 颜色调色板（来自配置）
+
+    # ---- 构造汇总表格（每个方法占一行）----
+    summary_rows = []   # 收集各方法的汇总数据行
     for method, res in all_results.items():
-        mean = res.get("clients_mean", {})
-        std = res.get("clients_std", {})
+        mean = res.get("clients_mean", {})   # 跨客户端均值
+        std = res.get("clients_std", {})      # 跨客户端标准差
         summary_rows.append({
             "method": method,
-            "MAE_mean": mean.get("MAE", float("nan")),
-            "MAE_std": std.get("MAE", float("nan")),
-            "RMSE_mean": mean.get("RMSE", float("nan")),
-            "RMSE_std": std.get("RMSE", float("nan")),
-            "Pearson_r_mean": mean.get("Pearson_r", float("nan")),
-            "Pearson_r_std": std.get("Pearson_r", float("nan")),
-            "R2_mean": mean.get("R2", float("nan")),
-            "R2_std": std.get("R2", float("nan")),
+            "MAE_mean": mean.get("MAE", float("nan")),       # MAE 均值
+            "MAE_std": std.get("MAE", float("nan")),          # MAE 标准差
+            "RMSE_mean": mean.get("RMSE", float("nan")),     # RMSE 均值
+            "RMSE_std": std.get("RMSE", float("nan")),        # RMSE 标准差
+            "Pearson_r_mean": mean.get("Pearson_r", float("nan")),    # Pearson_r 均值
+            "Pearson_r_std": std.get("Pearson_r", float("nan")),      # Pearson_r 标准差
+            "R2_mean": mean.get("R2", float("nan")),          # R² 均值
+            "R2_std": std.get("R2", float("nan")),             # R² 标准差
         })
 
-    # 单独列出 M4Fed 服务器端指标（与客户端指标并列对比）
+    # 单独列出 M4Fed 服务器端指标（与其他方法的客户端指标并列对比，std=0 因为只有一个服务器）
     if "m4fed" in all_results:
-        sr = all_results["m4fed"].get("server", {})
+        sr = all_results["m4fed"].get("server", {})   # 服务器评估指标
         summary_rows.append({
             "method": "M4Fed-server",
-            "MAE_mean": sr.get("MAE", float("nan")), "MAE_std": 0,
-            "RMSE_mean": sr.get("RMSE", float("nan")), "RMSE_std": 0,
+            "MAE_mean": sr.get("MAE", float("nan")), "MAE_std": 0,         # 服务器 MAE（无方差）
+            "RMSE_mean": sr.get("RMSE", float("nan")), "RMSE_std": 0,      # 服务器 RMSE
             "Pearson_r_mean": sr.get("Pearson_r", float("nan")), "Pearson_r_std": 0,
             "R2_mean": sr.get("R2", float("nan")), "R2_std": 0,
         })
 
-    summary_df = pd.DataFrame(summary_rows)
-    save_csv(summary_df, os.path.join(results_dir, "summary_domain_metrics.csv"))
+    summary_df = pd.DataFrame(summary_rows)   # 转为 DataFrame
+    save_csv(summary_df, os.path.join(results_dir, "summary_domain_metrics.csv"))   # 保存 CSV
     print("[汇总] 领域指标汇总表已保存。")
 
     # ---- 绘制各指标的柱状图（含误差棒）----
-    # 定义显示标签映射（内部键 → 论文图表展示名称）
+    # 内部方法名 → 论文图表展示名称的映射
     bname_map = {
         "fedavg": "FedAvg", "fedprox": "FedProx", "fan": "FAN",
         "gptfl": "GPT-FL", "m4fed": "M4Fed-clients", "M4Fed-server": "M4Fed-server",
     }
-    metric_means = {}
-    metric_stds = {}
+    metric_means = {}   # {显示名称: {指标名: 均值}}
+    metric_stds = {}    # {显示名称: {指标名: 标准差}}
     for row in summary_rows:
-        m = row["method"]
-        label = bname_map.get(m, m)
+        m = row["method"]                       # 内部方法名
+        label = bname_map.get(m, m)             # 转换为显示名称
         metric_means[label] = {
             "MAE": row.get("MAE_mean", float("nan")),
             "RMSE": row.get("RMSE_mean", float("nan")),
@@ -278,56 +308,64 @@ def _save_summary_and_figures(all_results: dict, results_dir: str, cfg) -> None:
             "R2": row.get("R2_std", 0),
         }
 
-    figs_dir = ensure_dir(os.path.join(results_dir, "figures"))
+    figs_dir = ensure_dir(os.path.join(results_dir, "figures"))   # 创建图表目录
     for metric in ["MAE", "RMSE", "Pearson_r", "R2"]:
         plot_metric_bars(
-            metric_means, metric_stds,
-            metric_name=metric,
-            palette=palette,
-            save_path=os.path.join(figs_dir, f"bar_{metric}"),
-            fmt=fmt,
+            metric_means, metric_stds,   # 均值和标准差字典
+            metric_name=metric,           # 当前指标名
+            palette=palette,              # 颜色调色板
+            save_path=os.path.join(figs_dir, f"bar_{metric}"),   # 保存路径
+            fmt=fmt,                      # 文件格式
         )
     print("[汇总] 指标柱状图已保存至", figs_dir)
 
 
 def _cuda_available() -> bool:
-    """检查 CUDA 是否可用。"""
-    import torch
-    return torch.cuda.is_available()
+    """
+    检查 CUDA GPU 是否可用（用于自动降级到 CPU）。
+
+    返回：
+      True 表示 CUDA 可用，False 表示无 GPU 或 PyTorch 未启用 CUDA
+    """
+    import torch   # 局部导入（此函数调用频率低）
+    return torch.cuda.is_available()   # 检查 CUDA 设备是否可用
 
 
 def _load_openmind_ds_ids(cfg) -> list:
     """
-    从 HuggingFace OpenMind 流式加载子数据集 ID 列表。
+    获取 OpenMind 有效子数据集 ID 列表（T1w 模态 + age 非空）。
 
-    使用流式模式（streaming=True）避免下载完整数据集。
-    最多读取 200 个唯一 dataset_id（满足后停止，提高速度）。
+    优先级：
+      1. 本地 openneuro_metadata.csv（cfg.data.local_metadata_csv），覆盖全量数据集，无网络开销
+      2. HuggingFace 元数据接口（hf_hub_download openneuro_metadata.csv），需网络
+      3. 100 个虚拟 ID（离线调试用，不可用于正式实验）
 
-    若加载失败（网络问题/权限问题），回退到虚拟 ID 列表并打印警告。
+    参数：
+      cfg : 配置对象（含 local_metadata_csv、hf_dataset_id、cache_dir 字段）
 
     返回：
       排序后的子数据集 ID 字符串列表
     """
-    print("[数据] 流式加载 OpenMind 数据集 ID...")
+    import os
+    from data.openmind_dataset import list_ds_ids_from_metadata, _load_openmind_metadata
+    # 1. 优先读取本地 CSV（全量 ds_id，无需 HuggingFace API 请求）
+    local_csv = cfg.data.local_metadata_csv
+    if local_csv and os.path.exists(local_csv):
+        print(f"[数据] 从本地 {local_csv} 读取子数据集 ID...")
+        return list_ds_ids_from_metadata(local_csv)
+    # 2. 本地文件不存在，通过 HuggingFace 下载元数据 CSV
+    print("[数据] 本地 CSV 不存在，从 HuggingFace 下载元数据...")
     try:
-        from datasets import load_dataset
-        ds = load_dataset(
-            cfg.data.hf_dataset_id,
-            split="train",
-            streaming=True,
-            trust_remote_code=True,
+        df = _load_openmind_metadata(
+            cfg.data.hf_dataset_id, cfg.data.cache_dir or None, "T1w"
         )
-        ds_ids = set()
-        for sample in ds:
-            ds_id = sample.get("dataset_id") or sample.get("ds_id") or "unknown"
-            ds_ids.add(str(ds_id))
-            if len(ds_ids) >= 200:   # 达到上限后停止（避免无限流式）
-                break
-        return sorted(ds_ids)
+        df = df[df["age"].notna()]
+        return sorted(df["ds_id"].unique().tolist())
     except Exception as e:
+        # 枚举失败时回退到虚拟 ID（用于调试或网络受限环境）
         print(f"[数据] 无法从 HuggingFace 加载：{e}，使用虚拟 ID 代替。")
-        return [f"ds{i:06d}" for i in range(100)]
+        return [f"ds{i:06d}" for i in range(100)]   # 返回 100 个虚拟 ID
 
 
 if __name__ == "__main__":
-    main()
+    main()   # 直接运行时调用主函数

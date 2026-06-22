@@ -13,7 +13,7 @@ nilearn>=0.10.3
 # ---- HuggingFace ----
 transformers>=4.40.0
 datasets>=2.18.0
-huggingface_hub>=0.22.0
+huggingface_hub>=0.23.0
 peft>=0.10.0
 accelerate>=0.29.0
 

@@ -1,13 +1,13 @@
-"""联邦服务器参与者。"""
-from __future__ import annotations
-import copy
-from typing import Dict, List, Optional
-from torch.utils.data import ConcatDataset
+"""联邦服务器参与者：代表协调方，持有公开数据且负责模型聚合和热身训练。"""
+from __future__ import annotations   # 允许注解中使用尚未定义的类名
+import copy                           # 标准库：深拷贝（备用，供子类扩展使用）
+from typing import Dict, List, Optional   # 类型注解工具
+from torch.utils.data import ConcatDataset   # PyTorch 数据集拼接工具
 
-from .base_participant import BaseParticipant
-from models.medmd.medmd import MedMD
-from models.neurofm.neurofm_multitask import NeuroFMMultiTask
-from data.openmind_dataset import OpenMindDataset, make_dataloader
+from .base_participant import BaseParticipant              # 参与者基类（含模型接口）
+from models.medmd.medmd import MedMD                       # MedMD 生成模型
+from models.neurofm.neurofm_multitask import NeuroFMMultiTask   # NeuroFM 多任务预测模型
+from data.openmind_dataset import OpenMindDataset, make_dataloader   # 数据集和 DataLoader 工厂
 
 
 class Server(BaseParticipant):
@@ -28,114 +28,140 @@ class Server(BaseParticipant):
       - 评估：公开数据 + 私有数据（test_loader）
     """
 
-    node_id = "server"
+    node_id = "server"   # 服务器的固定节点标识符（客户端为 "client_{id}"）
 
     def __init__(self, cfg, private_datasets: dict, public_datasets: dict,
                  device: str = "cpu"):
         """
         参数：
-          cfg              : 全局配置对象
+          cfg              : 全局配置对象（M4FedConfig）
           private_datasets : 服务器私有数据集 {'train': Dataset, 'test': Dataset}
           public_datasets  : 服务器公开数据集 {'train': Dataset, 'test': Dataset}
-          device           : 计算设备
+          device           : 计算设备（"cuda" 或 "cpu"）
         """
-        super().__init__(cfg, device)
-        self.private_datasets = private_datasets
-        self.public_datasets = public_datasets
+        super().__init__(cfg, device)            # 调用基类初始化（设置 cfg、device 等公共属性）
+        self.private_datasets = private_datasets  # 保存私有数据集（联邦协议中的私有部分）
+        self.public_datasets = public_datasets    # 保存公开数据集（MedMD 热身训练使用）
 
-        # ---- 混合 DataLoader（公开 + 私有，用于评估和全量训练） ----
+        # ---- 混合 DataLoader（公开 + 私有，用于全量评估和全量训练） ----
+        # 将公开训练集和私有训练集合并（服务器特有权限，可访问两类数据）
         combined_train = ConcatDataset([
-            public_datasets["train"],
-            private_datasets["train"],
+            public_datasets["train"],   # 公开训练数据集
+            private_datasets["train"],  # 服务器私有训练数据集
         ])
+        # 将公开测试集和私有测试集合并（评估服务器的全部数据）
         combined_test = ConcatDataset([
-            public_datasets["test"],
-            private_datasets["test"],
+            public_datasets["test"],    # 公开测试数据集
+            private_datasets["test"],   # 服务器私有测试数据集
         ])
+        # 全量混合训练 DataLoader（用于评估和全局训练）
         self.train_loader = make_dataloader(
-            combined_train, cfg.training.batch_size,
-            shuffle=True, num_workers=cfg.training.num_workers, seed=cfg.training.seed,
+            combined_train,                         # 合并的训练数据集
+            cfg.training.batch_size,                # 批大小
+            shuffle=True,                           # 训练时打乱顺序
+            num_workers=cfg.training.num_workers,   # 并行 worker 数
+            seed=cfg.training.seed,                 # 随机种子（保证可复现）
         )
+        # 全量混合测试 DataLoader（不打乱，保证评估结果可比较）
         self.test_loader = make_dataloader(
-            combined_test, cfg.training.batch_size,
-            shuffle=False, num_workers=cfg.training.num_workers, seed=cfg.training.seed,
+            combined_test,                          # 合并的测试数据集
+            cfg.training.batch_size,                # 批大小
+            shuffle=False,                          # 测试集不打乱
+            num_workers=cfg.training.num_workers,   # 并行 worker 数
+            seed=cfg.training.seed,                 # 随机种子
         )
 
-        # ---- 独立 DataLoader（分阶段训练用） ----
-        # 热身阶段 MedMD 只用公开数据
+        # ---- 独立 DataLoader（分阶段训练专用，细粒度控制） ----
+        # 热身阶段 MedMD 只在公开数据上训练（公开数据质量高，适合预热 U-Net）
         self.public_train_loader = make_dataloader(
-            public_datasets["train"], cfg.training.batch_size,
-            shuffle=True, num_workers=cfg.training.num_workers, seed=cfg.training.seed,
+            public_datasets["train"],               # 只使用公开训练数据
+            cfg.training.batch_size,                # 批大小
+            shuffle=True,                           # 热身训练打乱顺序
+            num_workers=cfg.training.num_workers,   # 并行 worker 数
+            seed=cfg.training.seed,                 # 随机种子
         )
-        # 本地训练阶段 NeuroFM 只用私有数据（保证私有性）
+        # 本地训练阶段 NeuroFM 只在私有数据上训练（严格保护私有数据不外泄）
         self.private_train_loader = make_dataloader(
-            private_datasets["train"], cfg.training.batch_size,
-            shuffle=True, num_workers=cfg.training.num_workers, seed=cfg.training.seed,
+            private_datasets["train"],              # 只使用私有训练数据
+            cfg.training.batch_size,                # 批大小
+            shuffle=True,                           # 本地训练打乱顺序
+            num_workers=cfg.training.num_workers,   # 并行 worker 数
+            seed=cfg.training.seed,                 # 随机种子
         )
 
     def build_models(
         self,
-        task_specs: dict,
-        random_init_neurofm: bool = False,
+        task_specs: dict,                    # 预测任务规格字典（任务名 → 类别数/连续）
+        random_init_neurofm: bool = False,   # 是否随机初始化 NeuroFM 骨干（消融实验用）
     ) -> None:
         """
         构建服务器的 MedMD 和 NeuroFM 模型实例。
 
-        与客户端相同，NeuroFM 可以选择预训练权重或随机初始化（消融实验用）。
+        与客户端构建逻辑基本一致，但 MedMD 的 VAE 校准使用公开数据
+        （而非私有数据），因为热身训练本身在公开数据上进行。
+
+        参数：
+          task_specs           : 预测任务规格字典（见 NeuroFMMultiTask 说明）
+          random_init_neurofm  : 是否随机初始化 NeuroFM 骨干（消融实验 C 用）
         """
+        # 构建 MedMD 生成模型并移动到指定设备
         self.medmd = MedMD(self.cfg.model, device=self.device).to(self.device)
         if self.cfg.model.calibrate_vae_scale:
-            # 服务器 MedMD 用公开数据进行热身训练，校准也使用公开数据
+            # 服务器 MedMD 用公开数据进行热身，VAE 校准也使用公开数据
+            # （公开数据分布更广，统计的 std 更具代表性）
             self.medmd.calibrate_scale_factor(
-                self.public_train_loader,
-                n_batches=self.cfg.model.vae_calibration_batches,
+                self.public_train_loader,                       # 公开训练数据 DataLoader
+                n_batches=self.cfg.model.vae_calibration_batches,  # 校准批次数
             )
+        # 构建 NeuroFM 多任务预测模型并移动到指定设备
         self.neurofm = NeuroFMMultiTask(
-            repo_id=self.cfg.model.neurofm_repo,
-            task_specs=task_specs,
-            device=self.device,
-            random_init=random_init_neurofm,
-            age_loss_weight=self.cfg.training.age_loss_weight,
+            repo_id=self.cfg.model.neurofm_repo,           # 预训练骨干的 HuggingFace 仓库 ID
+            task_specs=task_specs,                          # 任务规格字典
+            device=self.device,                             # 计算设备
+            random_init=random_init_neurofm,                # 是否随机初始化骨干（消融用）
+            age_loss_weight=self.cfg.training.age_loss_weight,  # 年龄回归损失权重
         ).to(self.device)
 
     def n_private_train(self) -> int:
-        """返回服务器私有训练集的样本数。"""
-        return len(self.private_datasets["train"])
+        """返回服务器私有训练集的样本数（用于日志和合成数据量计算）。"""
+        return len(self.private_datasets["train"])   # 取 Dataset 长度
 
     def n_public_train(self) -> int:
-        """返回服务器公开训练集的样本数。"""
-        return len(self.public_datasets["train"])
+        """返回服务器公开训练集的样本数（用于热身阶段数据量统计）。"""
+        return len(self.public_datasets["train"])    # 取 Dataset 长度
 
     def add_synthetic_data_to_loader(
         self,
-        synthetic_samples: list,
-        merge_with: str = "private",
+        synthetic_samples: list,        # 合成样本字典列表（与 OpenMindDataset 格式兼容）
+        merge_with: str = "private",    # 合并基础数据集的选择（"private" 或其他）
     ):
         """
         将合成样本与服务器现有数据合并，返回新的 DataLoader。
 
         本地训练阶段：服务器将自身合成的数据（从私有数据生成）
-        与现有数据合并，以增加训练多样性。
+        与现有数据合并，以增加训练多样性，缓解服务器数据分布偏差。
 
         参数：
           synthetic_samples : 合成样本字典列表
           merge_with        : 合并策略：
-                              "private" - 只与私有数据合并
-                              其他值   - 与公开+私有数据合并
+                              "private" - 只与私有数据合并（默认）
+                              其他值   - 与公开+私有数据全部合并
 
         返回：
-          合并后的 DataLoader（shuffle=True）
+          合并后的 DataLoader（shuffle=True，用于本地训练）
         """
+        # 将合成样本包装为 OpenMindDataset 对象（统一数据接口格式）
         syn_ds = OpenMindDataset(
-            synthetic_samples,
-            mri_shape=tuple(self.cfg.data.mri_shape),
+            synthetic_samples,                         # 合成样本字典列表
+            mri_shape=tuple(self.cfg.data.mri_shape),  # MRI 目标分辨率（与真实数据一致）
         )
         if merge_with == "private":
-            base_ds = self.private_datasets["train"]
+            base_ds = self.private_datasets["train"]   # 只与私有训练数据合并
         else:
-            # 合并公开数据和私有数据
+            # 非 "private" 策略：合并公开+私有训练数据作为基础数据集
             base_ds = ConcatDataset([self.public_datasets["train"],
                                      self.private_datasets["train"]])
-        merged = ConcatDataset([base_ds, syn_ds])
+        merged = ConcatDataset([base_ds, syn_ds])   # 合并基础数据集和合成数据集
+        # 返回合并后的 DataLoader（训练模式，shuffle=True）
         return make_dataloader(merged, self.cfg.training.batch_size,
                                shuffle=True, seed=self.cfg.training.seed)

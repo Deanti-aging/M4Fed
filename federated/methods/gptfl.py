@@ -1,199 +1,219 @@
 """
-GPT-FL 基线（He et al., 2023）。
+GPT-FL 基线（He et al., 10.1109/CVPRW67362.2025.00164）。
 
-核心思想：
-  服务器端拥有预训练生成模型（MedMD），通过接收客户端的年龄标签分布
-  生成"公共合成数据集"，分发给所有客户端，替代真实公开数据集。
+训练配置：
+  - 1 个 server + 3 个 clients，每个 client 有 20 个子数据集的 private data
+  - 生成模型（generative model）：M4Fed 热身阶段在 server 上预训练好的 MedMD
+  - 领域模型（domain model）：NeuroFM，参数随机初始化
 
-与 FAN 的区别：
-  - 服务器可以加载 M4Fed 热身阶段训练好的 MedMD 权重（如果可用）
-  - 服务器以纯文本条件（只有年龄标签，无 MRI 源图像）生成合成数据
-    （即调用 MedMD.synthesise_from_label()，而非 img2img 模式）
-  - 客户端收到服务器合成数据后的训练流程与 FAN 类似
+训练过程：
+  热身阶段（Warm-up）：
+    1. 每个 client 将本地 private data 的 age 标签值发送给 server
+    2. server 合并 age 标签值并删除重复项
+    3. server 使用 MedMD 仅以 "age is <age_val>" 为 condition（不使用 img）
+       推理生成 synthetic 3D MRI，数量等于所有 clients 的 private data 数量之和
+    4. server 用 synthetic data 预训练 NeuroFM（domain model）
+    5. server 将预训练好的 NeuroFM 分发给每个 client
 
-三个阶段：
-  1. 热身阶段：服务器收集客户端年龄标签，用 MedMD 生成"公共合成集"
-  2. 联邦循环：客户端生成数据 + 服务器公共合成数据一起更新客户端 MedMD
-  3. 本地训练：客户端合成数据 + 服务器公共合成数据训练 NeuroFM
+  联邦循环阶段（Federated Loop）：
+    - 训练轮数 = federated_rounds
+    - 训练方式同 FedAvg（服务器广播全局 NeuroFM → 客户端在 private data 上本地训练 → FedAvg 聚合）
 """
 from __future__ import annotations
-import copy, math, os
+import copy, os
 import numpy as np
 import pandas as pd
 from typing import List
-from torch.utils.data import ConcatDataset
 
-from training.medmd_trainer import MedMDTrainer
 from training.neurofm_trainer import NeuroFMTrainer
 from evaluation.metrics import compute_domain_metrics
 from data.openmind_dataset import OpenMindDataset, make_dataloader
 from utils.io_utils import save_csv, save_model, ensure_dir, load_model
+from utils.timing_utils import record_timing
+import time
 
 
 def run_gptfl(
-    server,
-    clients: List,
-    cfg,
-    task_specs: dict,
-    results_dir: str,
-    pretrained_medmd_path: str = None,
+    server,                              # Server 实例（持有预训练 MedMD，负责热身阶段合成与预训练）
+    clients: List,                       # Client 实例列表
+    cfg,                                 # 全局 M4FedConfig 配置对象
+    task_specs: dict,                    # 预测任务规格字典
+    results_dir: str,                    # 结果保存根目录
+    pretrained_medmd_path: str = None,   # M4Fed 热身阶段保存的服务器 MedMD 权重路径（可选）
 ) -> dict:
     """
     运行 GPT-FL 联邦训练协议。
 
     参数：
-      pretrained_medmd_path : M4Fed 热身阶段保存的服务器 MedMD 权重路径。
-                              若存在，加载该权重以获得更好的生成质量；
-                              若不存在，服务器 MedMD 随机初始化。
+      server               : Server 实例（持有 MedMD，热身阶段生成 synthetic data 并预训练 NeuroFM）
+      clients              : Client 实例列表
+      cfg                  : M4FedConfig 全局配置
+      task_specs           : 预测任务规格字典
+      results_dir          : 结果保存根目录
+      pretrained_medmd_path: M4Fed 热身阶段保存的服务器 MedMD 权重路径。
+                             若存在，加载该权重以获得更好的生成质量；
+                             若不存在，服务器 MedMD 随机初始化。
+
+    返回：
+      {
+        'client_0': 指标字典,
+        'client_1': 指标字典,
+        'clients_mean': 均值,
+        'clients_std': 标准差,
+      }
     """
     device = cfg.training.device
     out = ensure_dir(os.path.join(results_dir, "gptfl"))
 
-    # 所有客户端随机初始化 NeuroFM
+    # 所有客户端随机初始化 NeuroFM（GPT-FL domain model 随机初始化，后由 server 分发预训练权重）
     for c in clients:
         c.build_models(task_specs, random_init_neurofm=True)
 
-    # ---- 服务器加载预训练 MedMD（如果可用） ----
+    # 服务器：NeuroFM 随机初始化，MedMD 加载 M4Fed 预训练权重（若可用）
+    server.build_models(task_specs, random_init_neurofm=True)
     if pretrained_medmd_path and os.path.exists(pretrained_medmd_path):
-        from models.medmd.medmd import MedMD
-        server.build_models(task_specs, random_init_neurofm=False)
         load_model(server.medmd, pretrained_medmd_path, strict=False)
         print(f"[GPT-FL] 成功加载预训练 MedMD：{pretrained_medmd_path}")
     else:
-        server.build_models(task_specs, random_init_neurofm=False)
         print("[GPT-FL] 未找到预训练 MedMD，使用随机初始化 MedMD。")
 
+    _train_t0 = time.perf_counter()
+
     # ------------------------------------------------------------------ #
-    # 阶段 1：热身（服务器根据年龄标签生成公共合成数据集）                      #
+    # 热身阶段（Warm-up）                                                    #
     # ------------------------------------------------------------------ #
     print("[GPT-FL] === 热身阶段 ===")
 
-    # 从所有客户端收集年龄标签（不共享 MRI 数据，保护隐私）
+    # Step 1：从每个 client 收集本地 private data 的 age 标签值，server 合并并去重
     all_ages = set()
     for c in clients:
         for batch in c.train_loader:
             ages = batch["age"].numpy()
-            # 过滤 NaN，收集有效年龄值（取整，作为文本条件）
             all_ages.update(int(a) for a in ages if not np.isnan(a))
     all_ages = sorted(all_ages)
+    print(f"[GPT-FL] 收集到 {len(all_ages)} 个唯一 age 标签值")
 
-    server_gen_trainer = MedMDTrainer(server.medmd, device=device, lr=cfg.training.lr_medmd,
-                                       mixed_precision=cfg.training.mixed_precision,
-                                       use_qlora=False)
+    # Step 2：server 以纯文本条件（"age is <age_val>"，不使用 img）生成 synthetic data
+    # 合成数量 = 所有 clients 的 private data 数量之和
+    n_total = max(1, sum(c.n_private_train() for c in clients))
+    print(f"[GPT-FL] 目标合成数量：{n_total}（所有 clients private data 之和）")
 
-    # 服务器使用纯文本条件（"age is {v}"）生成与公开数据集等量的合成样本
-    n_pub = max(1, len(server.public_datasets["train"]))
-    server_public_syn = []
-    for age_val in all_ages:
-        if len(server_public_syn) >= n_pub:
-            break
-        # synthesise_from_label：从随机噪声出发，以年龄文本条件生成脑 MRI
+    # 循环遍历 age 标签值，均匀覆盖各年龄段
+    age_cycle = (all_ages * (n_total // max(len(all_ages), 1) + 1))[:n_total]
+    server_syn = []
+    for idx, age_val in enumerate(age_cycle):
         batch_mri = server.medmd.synthesise_from_label(
             age_label=age_val,
             batch_size=1,
             mri_shape=tuple(cfg.data.mri_shape),
-            noise_strength=cfg.model.noise_strength_fed,
             ddim_steps=cfg.model.ddim_steps,
         )
-        server_public_syn.append({
+        server_syn.append({
             "mri_array": batch_mri[0].cpu().numpy(),
             "table_text": f"age is {age_val}",
             "age": float(age_val),
             "metadata": {},
         })
+        if (idx + 1) % max(1, n_total // 10) == 0:
+            print(f"[GPT-FL]   已生成 {idx+1}/{n_total} 个 synthetic 样本")
 
-    # 初始化各客户端的训练器
-    all_losses = {f"client_{c.client_id}": [] for c in clients}
-    client_gen_trainers = []
-    client_dom_trainers = []
+    # Step 3：server 在 synthetic data 上预训练 NeuroFM（domain model）
+    syn_ds = OpenMindDataset(server_syn, tuple(cfg.data.mri_shape))
+    syn_loader = make_dataloader(syn_ds, cfg.training.batch_size,
+                                 shuffle=True, seed=cfg.training.seed)
+    server_dom_trainer = NeuroFMTrainer(
+        server.neurofm, device=device,
+        lr=cfg.training.lr_neurofm,
+        mixed_precision=cfg.training.mixed_precision,
+        use_qlora=False,
+    )
+    warmup_losses = []
+    print(f"[GPT-FL] 在 synthetic data 上预训练 NeuroFM（{cfg.federated.warm_rounds} epochs）")
+    for ep in range(cfg.federated.warm_rounds):
+        loss = server_dom_trainer.train_epoch(syn_loader)
+        warmup_losses.append({"phase": "warmup", "round": ep, "loss": loss})
+        print(f"[GPT-FL]   warmup epoch {ep+1}/{cfg.federated.warm_rounds}，loss={loss:.4f}")
+
+    # Step 4：server 将预训练好的 NeuroFM 分发给每个 client
+    global_state = copy.deepcopy(server.neurofm.state_dict())
     for c in clients:
-        client_gen_trainers.append(
-            MedMDTrainer(c.medmd, device=device, lr=cfg.training.lr_medmd,
-                         mixed_precision=cfg.training.mixed_precision,
-                         use_qlora=False))
-        client_dom_trainers.append(
-            NeuroFMTrainer(c.neurofm, device=device, lr=cfg.training.lr_neurofm,
-                           mixed_precision=cfg.training.mixed_precision,
-                           use_qlora=False))
+        c.neurofm.load_state_dict(copy.deepcopy(global_state))
+    print("[GPT-FL] NeuroFM 预训练权重已分发给所有 clients")
 
     # ------------------------------------------------------------------ #
-    # 阶段 2：联邦循环                                                       #
+    # 联邦循环阶段（Federated Loop，训练方式同 FedAvg）                        #
     # ------------------------------------------------------------------ #
-    print("[GPT-FL] === 联邦循环阶段 ===")
-    for rnd in range(cfg.federated.federated_rounds):
-        print(f"[GPT-FL] 第 {rnd+1}/{cfg.federated.federated_rounds} 轮")
+    print("[GPT-FL] === 联邦循环阶段（FedAvg） ===")
+    n_rounds = cfg.federated.federated_rounds
+    all_losses = {f"client_{c.client_id}": [] for c in clients}
 
-        # 每个客户端生成合成数据
-        synth_per_client = []
-        for i, c in enumerate(clients):
-            n_syn = max(1, math.ceil(c.n_private_train() * cfg.federated.synth_ratio_fed))
-            syn = client_gen_trainers[i].synthesise_dataset(
-                c.train_loader, n_syn,
-                noise_strength=cfg.model.noise_strength_fed,
-                ddim_steps=cfg.model.ddim_steps,
+    for rnd in range(n_rounds):
+        print(f"[GPT-FL] 第 {rnd+1}/{n_rounds} 轮")
+
+        local_states = []
+        local_ns = []
+
+        for c in clients:
+            # 广播：将全局 NeuroFM 权重分发给客户端
+            c.neurofm.load_state_dict(copy.deepcopy(global_state))
+
+            # 客户端在本地 private data 上训练 1 epoch（与 FedAvg 一致）
+            trainer = NeuroFMTrainer(
+                c.neurofm, device=device,
+                lr=cfg.training.lr_neurofm,
+                mixed_precision=cfg.training.mixed_precision,
+                use_qlora=False,
             )
-            synth_per_client.append(syn)
+            losses = trainer.train(c.train_loader, n_epochs=1)
+            all_losses[f"client_{c.client_id}"].append(
+                {"phase": "federated", "round": rnd, "loss": losses[0]}
+            )
+            local_states.append(copy.deepcopy(c.neurofm.state_dict()))
+            local_ns.append(c.n_train_samples())
 
-        # 每个客户端：用服务器公共合成数据 + 其他客户端合成数据更新生成模型
-        for i, c in enumerate(clients):
-            external = server_public_syn.copy()    # 服务器公共合成数据
-            for j, syn in enumerate(synth_per_client):
-                if j != i:
-                    external.extend(syn)           # 其他客户端的合成数据
-            if not external:
-                continue
-            ext_ds = OpenMindDataset(external, tuple(cfg.data.mri_shape))
-            # 合并本地私有数据和外部合成数据
-            merged = ConcatDataset([c.private_datasets["train"], ext_ds])
-            merged_loader = make_dataloader(merged, cfg.training.batch_size,
-                                            shuffle=True, seed=cfg.training.seed)
-            loss = client_gen_trainers[i].train_epoch(merged_loader)
-            all_losses[f"client_{c.client_id}"].append({"round": rnd, "loss": loss})
+        # FedAvg 加权平均聚合
+        global_state = _fedavg_aggregate(local_states, local_ns)
 
-    # ------------------------------------------------------------------ #
-    # 阶段 3：本地训练                                                       #
-    # ------------------------------------------------------------------ #
-    print("[GPT-FL] === 本地训练阶段 ===")
-    local_losses = {f"client_{c.client_id}": [] for c in clients}
-    noise_range = (cfg.model.noise_strength_local_min, cfg.model.noise_strength_local_max)
-    for i, c in enumerate(clients):
-        ns = float(np.random.uniform(*noise_range))
-        # 客户端合成数据（img2img，用于增强本地领域多样性）
-        syn = client_gen_trainers[i].synthesise_dataset(
-            c.train_loader, c.n_private_train(),
-            noise_strength=ns, ddim_steps=cfg.model.ddim_steps,
-        )
-        # 合并服务器公共合成数据和客户端自身合成数据
-        aug_syn_ds = OpenMindDataset(server_public_syn + syn, tuple(cfg.data.mri_shape))
-        merged_loader = make_dataloader(
-            ConcatDataset([c.private_datasets["train"], aug_syn_ds]),
-            cfg.training.batch_size, shuffle=True, seed=cfg.training.seed,
-        )
-        for ep in range(cfg.federated.local_rounds):
-            loss = client_dom_trainers[i].train_epoch(merged_loader)
-            local_losses[f"client_{c.client_id}"].append({"round": ep, "loss": loss})
+    record_timing("gptfl/train", time.perf_counter() - _train_t0)
 
-    # ---- 评估 ----
+    # ---- 评估阶段：将最终全局模型分发给各客户端并在测试集上评估 ----
+    _eval_t0 = time.perf_counter()
     results = {}
     for c in clients:
+        c.neurofm.load_state_dict(copy.deepcopy(global_state))
         t = NeuroFMTrainer(c.neurofm, device=device, lr=0, mixed_precision=False)
         y_true, y_pred = t.evaluate(c.test_loader)
         results[f"client_{c.client_id}"] = compute_domain_metrics(y_true, y_pred)
+    record_timing("gptfl/eval", time.perf_counter() - _eval_t0)
 
+    # 汇总跨客户端指标的均值和标准差
     client_keys = [f"client_{c.client_id}" for c in clients]
     agg = _agg({k: results[k] for k in client_keys})
     results["clients_mean"] = agg["mean"]
     results["clients_std"] = agg["std"]
 
-    # ---- 保存结果 ----
+    # ---- 保存结果到磁盘 ----
+    save_csv(pd.DataFrame(warmup_losses),
+             os.path.join(out, "server_warmup_losses.csv"))
     for c in clients:
         key = f"client_{c.client_id}"
-        combined = all_losses[key] + local_losses[key]
-        save_csv(pd.DataFrame(combined), os.path.join(out, f"{key}_losses.csv"))
-        save_csv(pd.DataFrame([results[key]]), os.path.join(out, f"{key}_metrics.csv"))
+        save_csv(pd.DataFrame(all_losses[key]),
+                 os.path.join(out, f"{key}_losses.csv"))
+        save_csv(pd.DataFrame([results[key]]),
+                 os.path.join(out, f"{key}_metrics.csv"))
         if cfg.eval.save_model:
             save_model(c.neurofm, os.path.join(out, f"client_{c.client_id}_neurofm.pt"))
+
     return results
+
+
+def _fedavg_aggregate(states: list, ns: list) -> dict:
+    """FedAvg 加权平均聚合：w_global = Σ_k (n_k / N) · w_k"""
+    total = sum(ns)
+    agg = copy.deepcopy(states[0])
+    for key in agg:
+        agg[key] = sum(s[key].float() * (n / total) for s, n in zip(states, ns))
+    return agg
 
 
 def _agg(d):
@@ -205,5 +225,5 @@ def _agg(d):
             vals[k].append(val)
     return {
         "mean": {k: float(np.nanmean(v)) for k, v in vals.items()},
-        "std":  {k: float(np.nanstd(v)) for k, v in vals.items()},
+        "std":  {k: float(np.nanstd(v))  for k, v in vals.items()},
     }

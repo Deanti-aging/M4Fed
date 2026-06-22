@@ -11,10 +11,10 @@
 
 加载完成后冻结所有参数（VAE 在 M4Fed 中始终保持固定，不参与训练）。
 """
-from __future__ import annotations
-import torch
-import torch.nn as nn
-from typing import Optional
+from __future__ import annotations  # 允许注解中使用尚未定义的类名
+import torch                        # PyTorch 深度学习框架
+import torch.nn as nn               # 神经网络模块（用于构建 MinimalVAE 备用模型）
+from typing import Optional         # 类型注解工具
 
 
 def load_vae(
@@ -44,47 +44,48 @@ def load_vae(
     返回：
       冻结的 VAE 模型（eval 模式，所有参数 requires_grad=False）
     """
-    # 尝试加载 MONAI GenerativeModels 中的 AutoencoderKL
+    # 尝试加载 MONAI GenerativeModels 中的 AutoencoderKL（需要安装 monai-generative 包）
     try:
-        from generative.networks.nets import AutoencoderKL
+        from generative.networks.nets import AutoencoderKL  # MONAI 生成模型库
         # 架构参数与 MONAI/brats_mri_generative_diffusion 的 train_autoencoder.json 完全对齐
         vae = AutoencoderKL(
-            spatial_dims=spatial_dims,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            latent_channels=latent_channels,
-            num_channels=(64, 128, 256),              # 3 个分辨率级别
-            attention_levels=(False, False, False),    # 无空间注意力（与预训练权重一致）
-            with_encoder_nonlocal_attn=False,
-            with_decoder_nonlocal_attn=False,
-            num_res_blocks=2,
-            norm_num_groups=32,
-            norm_eps=1e-6,
+            spatial_dims=spatial_dims,                             # 3D 空间（处理体积数据）
+            in_channels=in_channels,                               # 输入通道（灰度 MRI = 1）
+            out_channels=out_channels,                             # 输出通道（重建与输入一致）
+            latent_channels=latent_channels,                       # 潜空间通道数（=8，与 UNet 输入一致）
+            num_channels=(64, 128, 256),                           # 3 个分辨率级别的特征通道数
+            attention_levels=(False, False, False),                # 无空间注意力（与预训练权重设置一致）
+            with_encoder_nonlocal_attn=False,                      # 编码器不使用非局部注意力
+            with_decoder_nonlocal_attn=False,                      # 解码器不使用非局部注意力
+            num_res_blocks=2,                                      # 每个分辨率级别的残差块数
+            norm_num_groups=32,                                    # 组归一化的分组数
+            norm_eps=1e-6,                                         # 归一化层的数值稳定系数
         )
-        # 尝试从 HuggingFace Hub 下载预训练权重
+        # 尝试从 HuggingFace Hub 下载预训练权重（首次下载后本地缓存）
         if repo_id:
             try:
-                from huggingface_hub import hf_hub_download
+                from huggingface_hub import hf_hub_download         # HuggingFace 文件下载工具
                 weight_path = hf_hub_download(
-                    repo_id=repo_id,
-                    filename="models/model_autoencoder.pt",
-                    cache_dir=None,
+                    repo_id=repo_id,                                # HuggingFace 仓库 ID
+                    filename="models/model_autoencoder.pt",          # 仓库中的权重文件路径
+                    cache_dir=None,                                  # 使用默认缓存目录（~/.cache/huggingface）
                 )
-                state = torch.load(weight_path, map_location="cpu", weights_only=True)
-                vae.load_state_dict(state)
+                state = torch.load(weight_path, map_location="cpu", weights_only=True)  # 加载到 CPU
+                vae.load_state_dict(state)                          # 将预训练权重写入 VAE
                 print(f"[VAE] 已加载预训练权重：{repo_id}")
             except Exception as e:
+                # 下载失败（无网络/文件缺失等），继续使用随机初始化（训练前应手动下载）
                 print(f"[VAE] 无法加载预训练权重: {e}。使用随机初始化。")
     except ImportError:
-        # MONAI GenerativeModels 未安装，退回极简 VAE
+        # MONAI GenerativeModels 未安装，退回极简 VAE（不具备真实编解码质量）
         print("[VAE] MONAI GenerativeModels 未找到。使用 MinimalVAE 替代。")
-        vae = _MinimalVAE(in_channels, latent_channels)
+        vae = _MinimalVAE(in_channels, latent_channels)  # 创建极简 VAE 实例
 
-    # 冻结所有参数：VAE 在整个训练过程中保持固定
+    # 冻结所有参数：VAE 在整个训练过程中保持固定（不参与反向传播）
     for p in vae.parameters():
-        p.requires_grad_(False)
-    vae.eval()
-    return vae.to(device)
+        p.requires_grad_(False)   # 将所有参数的梯度标志设为 False
+    vae.eval()                     # 切换为推理模式（关闭 BatchNorm/Dropout 的训练行为）
+    return vae.to(device)          # 将模型移动到指定设备（CPU/CUDA）并返回
 
 
 # --------------------------------------------------------------------------- #
@@ -107,36 +108,36 @@ class _MinimalVAE(nn.Module):
     """
 
     def __init__(self, in_ch: int = 1, lat_ch: int = 4):
-        super().__init__()
-        self.lat_ch = lat_ch
-        # 编码器：空间分辨率 × 1/4，通道数 × lat_ch * 2
+        super().__init__()   # 调用父类 nn.Module 的初始化方法
+        self.lat_ch = lat_ch  # 保存潜空间通道数，供 encode 时使用
+        # 编码器：空间分辨率 × 1/4，通道数 × lat_ch * 2（前半为均值，后半为对数方差）
         self.encoder = nn.Sequential(
-            nn.Conv3d(in_ch, 8, 3, stride=2, padding=1),
-            nn.SiLU(),
-            nn.Conv3d(8, lat_ch * 2, 3, stride=2, padding=1),
+            nn.Conv3d(in_ch, 8, 3, stride=2, padding=1),  # 第1层：输入通道→8通道，空间 ×1/2
+            nn.SiLU(),                                      # SiLU（Swish）激活函数
+            nn.Conv3d(8, lat_ch * 2, 3, stride=2, padding=1),  # 第2层：8→lat_ch*2通道，空间 ×1/2
         )
-        # 解码器：空间分辨率 × 4，通道数恢复为 in_ch
+        # 解码器：空间分辨率 × 4，通道数恢复为 in_ch（转置卷积上采样）
         self.decoder = nn.Sequential(
-            nn.ConvTranspose3d(lat_ch, 8, 4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.ConvTranspose3d(8, in_ch, 4, stride=2, padding=1),
-            nn.Tanh(),   # 输出值域 [-1, 1]
+            nn.ConvTranspose3d(lat_ch, 8, 4, stride=2, padding=1),  # 第1层：上采样 ×2
+            nn.SiLU(),                                                # SiLU 激活
+            nn.ConvTranspose3d(8, in_ch, 4, stride=2, padding=1),    # 第2层：上采样 ×2，恢复原始通道
+            nn.Tanh(),   # Tanh 激活：将输出值域限制在 [-1, 1]，与 MRI 预处理后的值域一致
         )
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """编码：返回均值向量（丢弃方差部分，简化实现）。"""
-        h = self.encoder(x)
-        mu, _ = h.chunk(2, dim=1)   # 前半为均值，后半为对数方差
-        return mu
+        h = self.encoder(x)               # 通过编码器得到 2×lat_ch 通道的特征图
+        mu, _ = h.chunk(2, dim=1)         # 沿通道维度分成两半：前半为均值（μ），后半为对数方差
+        return mu                          # 只返回均值向量（简化：忽略重参数化采样）
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """解码：潜向量 → 重建图像。"""
-        return self.decoder(z)
+        return self.decoder(z)  # 通过解码器将潜向量映射回图像空间
 
     def forward(self, x: torch.Tensor):
         """
         完整自编码前向传播，返回 (重建图像, None)。
         第二个返回值为 None，与 MONAI AutoencoderKL 的 (output, _) 接口兼容。
         """
-        z = self.encode(x)
-        return self.decode(z), None
+        z = self.encode(x)           # 编码：图像 → 潜向量
+        return self.decode(z), None  # 解码：潜向量 → 重建图像；None 占位（兼容 MONAI 接口）
