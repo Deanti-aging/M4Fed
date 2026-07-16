@@ -98,10 +98,14 @@ M4Fed/
 
 **3D cross-attention injection**: text embeddings (shape `[B, L, D_clip]`) are projected to match U-Net hidden dim and injected via spatial-cross-attention at each resolution level.
 
-### 3.2 NeuroFM Multi-task
+### 3.2 SwinUNETR Multi-task（领域预测模型）
 
-- Backbone: `NeuroAI-UofG/NeuroFM` (3D brain MRI transformer)
-- Task heads: one `Linear` per table field (MSE loss for continuous, CE for categorical)
+- Backbone: MONAI `SwinUNETR` encoder（swinViT，Tang et al., CVPR 2022）
+  - 预训练方式：masked image modeling 自监督预训练，数据集：MSD 脑 MRI
+  - 权重来源：MONAI 官方 SSL checkpoint（`model_swinvit.pt`）
+  - embed_dim = `feature_size × 16`（默认 `feature_size=48`，embed_dim=768）
+  - 替代原 `NeuroAI-UofG/NeuroFM`（TensorFlow `.h5` 格式，与 PyTorch 不兼容）
+- Task heads: one two-layer MLP per table field (MSE for continuous, CE for categorical)
 - Primary task: `age` prediction (brain age)
 - QLoRA applied to backbone during client fine-tuning
 
@@ -194,11 +198,14 @@ monai[all]>=1.3
 monai-generative>=0.2   # or install from source
 
 # HuggingFace ecosystem
-transformers>=4.40
+transformers>=4.40      # NeuroFM 加载（AutoModel）
 datasets>=2.18
 huggingface_hub>=0.22
 peft>=0.10              # QLoRA / LoRA
 accelerate>=0.29
+
+# BioMedCLIP（open_clip 模型，不能用 transformers.AutoModel）
+open-clip-torch>=2.24   # pip install open-clip-torch
 
 # TabPFN
 tabpfn>=2.0             # Prior-Labs tabpfn_2_5
@@ -321,11 +328,11 @@ einops>=0.7
 
 #### models/medmd/
 - **vae_wrapper.py**：尝试加载 MONAI `AutoencoderKL`，失败时退回 `_MinimalVAE`（8行简单3D VAE），始终冻结参数。
-- **conditioning.py**：`BioMedCLIPEncoder` 封装 BioMedCLIP text model，`forward(texts) → (B, seq_len, hidden_dim)`，失败时返回随机嵌入。
+- **conditioning.py**：`BioMedCLIPEncoder` 用 `open_clip` 加载 BioMedCLIP（`hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224`），直接调用 TextTransformer 内部取逐 token 隐藏状态（ln_final 之后、text_projection 之前），`forward(texts) → (B, context_length, hidden_dim)`；加载失败时返回随机嵌入。
 - **medmd.py**：`DDIMScheduler`（add_noise / get_timesteps_for_strength / ddim_step）+ `_SimpleUNet3D`（fallback）+ `MedMD`（`forward` 计算 LDM 损失；`synthesise` img2img；`synthesise_from_label` 纯文本生成 for GPT-FL）。
 
 #### models/neurofm/
-- **neurofm_multitask.py**：`_Backbone3DCNN`（fallback）+ `_TaskHead`（单任务线性头）+ `NeuroFMMultiTask`（多任务损失，age 权重×2，NaN 掩码处理）。
+- **neurofm_multitask.py**：`_Backbone3DCNN`（fallback）+ `_SwinUNETREncoder`（swinViT 封装，global avg pool → embed）+ `_TaskHead`（单任务 MLP 头）+ `SwinMultiTask`（多任务损失，age 权重×2，NaN 掩码处理）；`NeuroFMMultiTask` 为向后兼容别名。
 
 #### models/tabpfn_wrapper.py
 - 按列进行缺失值填补：连续字段用 `TabPFNRegressor`，类别字段用 `TabPFNClassifier`；库不可用时退回中位数/众数。
@@ -365,8 +372,8 @@ einops>=0.7
 
 | 类别 | 说明 |
 |------|------|
-| 依赖安装 | 需先按 `requirements.txt` 建立 conda/pip 环境；MONAI GenerativeModels 需从源码安装（`pip install git+https://github.com/Project-MONAI/GenerativeModels.git`） |
-| NeuroFM 加载 | `NeuroAI-UofG/NeuroFM` 需要 `trust_remote_code=True`；若模型结构与预期不符，自动退回 `_Backbone3DCNN` |
+| 依赖安装 | 需先按 `requirements.txt` 建立 conda/pip 环境；MONAI GenerativeModels 需从源码安装（`pip install git+https://github.com/Project-MONAI/GenerativeModels.git`）；BioMedCLIP 需要 `open-clip-torch`（`pip install open-clip-torch`），不能单独依赖 `transformers` 加载 |
+| SwinUNETR 加载 | 预训练权重通过 `torch.hub.load_state_dict_from_url` 下载，需要网络；下载失败时自动退回 `_Backbone3DCNN`；`feature_size` 须与 checkpoint 一致（默认 48） |
 | VAE 权重 | `katielink` 收藏中的具体 repo 名需确认；目前 `vae_repo` 默认值为占位符，实际使用需更新 `configs/m4fed.yaml` 中的 `vae_repo` 字段 |
 | HuggingFace 真实数据接入 | `AnonRes/OpenMind` 是按 `dsXXXXXX/` 文件夹组织的原始 NIfTI 文件仓库（114k 文件，800 个子数据集），配一份 38MB 的 `openneuro_metadata.csv`（列：`unique_id, modality, image_quality_score, age, weight, bmi, sex, handedness, race, health_status, manufacturer, model_name, phase_encoding_direction, magnetic_field_strength, repetition_time, echo_time, is_brain_extract, derived_from, image_path, anat_mask_path, anon_mask_path`），没有 `train` split 也没有 `dataset_id`/`ds_id` 字段。已改为：`list_openmind_ds_ids()` 枚举仓库文件路径前缀得到 ds_id；`make_openmind_sample_loader()` 下载/解析 CSV、按 `modality=="T1w"` 筛选（42.7k/114k 行）并按 ds_id 分组，返回的 `sample_loader_fn` 已接入 `main.py`/`run_all_baselines.py`/`ablation.py`/`sensitivity.py`/`cross_site.py` 的所有 `build_node_datasets` 调用；NIfTI 文件本身在 `OpenMindDataset.__getitem__` 中惰性下载（`_resolve_hf_path`，命中 huggingface_hub 本地缓存） |
 | 表格字段命名 | `preprocessing._CONTINUOUS_FIELDS`/`_IGNORE_FIELDS` 与 `table_to_text._FIELD_TEMPLATES` 原先使用的是猜测的通用 BIDS 字段名（`BMI`、`participant_id`、`filename`），与真实 CSV 列名不一致（真实列是小写 `bmi`，且没有 `participant_id`/`filename` 列，却有大量扫描技术列如 `manufacturer`/`image_path` 需要排除）。已对齐为真实列名 |

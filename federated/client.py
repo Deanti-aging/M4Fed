@@ -4,9 +4,9 @@ import copy                           # 标准库：深拷贝（备用，供子�
 from typing import Optional           # 类型注解：可选参数
 from torch.utils.data import ConcatDataset   # PyTorch 数据集拼接工具
 
-from .base_participant import BaseParticipant             # 参与者基类（含模型接口）
-from models.medmd.medmd import MedMD                      # MedMD 生成模型
-from models.neurofm.neurofm_multitask import NeuroFMMultiTask  # NeuroFM 多任务预测模型
+from .base_participant import BaseParticipant                       # 参与者基类（含模型接口）
+from models.medmd.medmd import MedMD                                # MedMD 生成模型
+from models.swin.swin_multitask import SwinMultiTask                 # SwinUNETR 多任务预测模型
 from data.openmind_dataset import OpenMindDataset, make_dataloader  # 数据集和 DataLoader 工厂
 
 
@@ -16,7 +16,7 @@ class Client(BaseParticipant):
 
     特征：
       - 只持有私有数据（不含公开数据）
-      - MedMD 和 NeuroFM 初始权重来自服务器分发
+      - MedMD 和 SwinMultiTask 初始权重来自服务器分发
       - 联邦循环中使用 QLoRA 微调（降低通信和计算开销）
       - 可接收合成数据并与私有数据合并训练
     """
@@ -54,37 +54,31 @@ class Client(BaseParticipant):
 
     def build_models(
         self,
-        task_specs: dict,                    # 预测任务规格字典（任务名 → 类别数/连续/离散）
-        random_init_neurofm: bool = False,   # 是否随机初始化 NeuroFM 骨干（消融实验 C 使用）
+        task_specs: dict,                 # 预测任务规格字典（任务名 → 类别数/连续/离散）
+        random_init_swin: bool = False,   # 是否随机初始化 SwinUNETR 骨干（消融实验 C 使用）
     ) -> None:
         """
-        构建客户端的 MedMD 和 NeuroFM 模型实例。
+        构建客户端的 MedMD 和 SwinMultiTask 模型实例。
 
-        调用时机：在每次实验开始前（或重置实验时），由实验脚本调用一次。
         权重初始化：
           - MedMD 的 U-Net 随机初始化（热身阶段后由服务器覆盖为预训练权重）
-          - NeuroFM 骨干：正式模式从 HuggingFace 加载预训练权重；
-                         random_init_neurofm=True 时随机初始化（消融实验用）
-
-        参数：
-          task_specs           : 预测任务规格字典（见 NeuroFMMultiTask 说明）
-          random_init_neurofm  : 是否随机初始化 NeuroFM 骨干（消融实验 C 用）
+          - SwinUNETR 骨干：正式模式下载 MONAI 官方 SSL 预训练权重；
+                           random_init_swin=True 时随机初始化（消融实验 C 用）
         """
-        # 构建 MedMD 生成模型并移动到指定设备（VAE 和文本编码器自动冻结）
         self.medmd = MedMD(self.cfg.model, device=self.device).to(self.device)
         if self.cfg.model.calibrate_vae_scale:
-            # 若配置要求校准 VAE 缩放因子，则在私有训练数据上统计潜向量标准差
             self.medmd.calibrate_scale_factor(
-                self.train_loader,                              # 使用私有训练数据
-                n_batches=self.cfg.model.vae_calibration_batches,  # 使用的批次数
+                self.train_loader,
+                n_batches=self.cfg.model.vae_calibration_batches,
             )
-        # 构建 NeuroFM 多任务预测模型并移动到指定设备
-        self.neurofm = NeuroFMMultiTask(
-            repo_id=self.cfg.model.neurofm_repo,          # 预训练骨干的 HuggingFace 仓库 ID
-            task_specs=task_specs,                         # 任务规格（决定各任务头的结构）
-            device=self.device,                            # 计算设备
-            random_init=random_init_neurofm,               # 是否随机初始化骨干权重
-            age_loss_weight=self.cfg.training.age_loss_weight,  # 年龄回归损失的权重系数
+        self.swin = SwinMultiTask(
+            pretrain_url=self.cfg.model.swinunetr_pretrain_url,
+            img_size=tuple(self.cfg.data.mri_shape),
+            feature_size=self.cfg.model.swinunetr_feature_size,
+            task_specs=task_specs,
+            device=self.device,
+            random_init=random_init_swin,
+            age_loss_weight=self.cfg.training.age_loss_weight,
         ).to(self.device)
 
     def n_private_train(self) -> int:

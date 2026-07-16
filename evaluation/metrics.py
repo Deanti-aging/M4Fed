@@ -21,7 +21,8 @@ def compute_domain_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, 
     """
     计算年龄预测任务的四个核心指标。
 
-    过滤规则：自动跳过真实值或预测值中的 NaN/Inf（无标签样本）。
+    过滤规则：自动跳过真实值或预测值中的 NaN/Inf（主要防模型输出的非有限值；
+             age 无标签样本已在建数据集阶段过滤，此处为通用健壮性兜底）。
     样本数 < 2 时返回全 NaN（无法计算相关系数等统计量）。
 
     参数：

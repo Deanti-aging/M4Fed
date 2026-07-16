@@ -4,28 +4,26 @@
 将元数据文本（如 "age is 32, sex is female"）编码为交叉注意力条件张量，
 供 U-Net 在去噪时使用。
 
-若 transformers 库或模型权重不可用，退回随机嵌入生成器
-（不影响管道流程，但合成质量无意义——仅用于冒烟测试）。
+BioMedCLIP 是 open_clip 模型，必须通过 open_clip 库加载。
+若 open_clip 不可用或权重下载失败，退回随机嵌入（仅用于冒烟测试）。
 """
-from __future__ import annotations   # 允许注解中使用尚未定义的类名
-import torch                         # PyTorch 深度学习框架
-import torch.nn as nn                # 神经网络模块基类
-from typing import List, Optional    # 类型注解工具
+from __future__ import annotations
+import torch
+import torch.nn as nn
+from typing import List
 
 
 class BioMedCLIPEncoder(nn.Module):
     """
-    使用 BioMedCLIP（基于 PubMedBERT 的生物医学 CLIP 模型）对文本进行编码。
+    使用 BioMedCLIP 对文本进行编码，输出逐 token 隐藏状态供交叉注意力使用。
 
-    BioMedCLIP 在大规模生物医学图像-文本对上预训练，
-    对医学术语（年龄、诊断、BMI 等）具有良好的语义理解能力。
+    本质上还是从 HuggingFace Hub 下载，
+    只是下载和解析的工具是 open_clip 而不是 transformers。
+    两者的区别只是客户端库不同，
+    数据来源都是 huggingface.co。
 
-    输出形状：(B, seq_len, hidden_dim)
-      - B       : batch size
-      - seq_len : 最大 token 长度（77，与 CLIP 对齐）
-      - hidden_dim: 隐藏层维度（BioMedCLIP 为 512）
-
-    所有参数在初始化后立即冻结（不参与训练）。
+    输出形状：(B, context_length, hidden_dim)
+    所有参数初始化后立即冻结。
     """
 
     def __init__(
@@ -34,83 +32,90 @@ class BioMedCLIPEncoder(nn.Module):
         device: str = "cpu",
         max_length: int = 77,
     ):
-        """
-        参数：
-          repo_id   : HuggingFace 仓库 ID
-          device    : 计算设备
-          max_length: tokenizer 最大序列长度（短句 pad，长句 truncate）
-        """
-        super().__init__()           # 调用 nn.Module 父类初始化
-        self.device = device         # 保存计算设备字符串（用于生成随机嵌入时指定设备）
-        self.max_length = max_length  # 最大 token 序列长度（短句补零，长句截断）
-        self.hidden_dim = 512         # BioMedCLIP 文本编码的默认维度（后续可能被动态更新）
+        super().__init__()
+        self.device = device
+        self.max_length = max_length
+        self.hidden_dim = 512  # BioMedCLIP text transformer width
 
-        self._loaded = False    # 标记模型是否已成功加载（False = 使用随机嵌入作为退回方案）
-        self._load(repo_id)     # 尝试从 HuggingFace 加载 tokenizer 和文本模型
+        self._loaded = False
+        self._load(repo_id)
 
-        # 冻结所有参数：文本编码器在训练过程中保持固定（仅作为特征提取器）
         for p in self.parameters():
-            p.requires_grad_(False)  # 关闭所有参数的梯度计算
-        self.eval()   # 切换为推理模式（关闭 Dropout 和 BatchNorm 的训练行为）
+            p.requires_grad_(False)
+        self.eval()
 
     def _load(self, repo_id: str) -> None:
-        """
-        从 HuggingFace 加载 tokenizer 和文本模型。
-        失败时设置 _loaded=False，forward 将返回随机嵌入。
-        """
+        """用 open_clip 加载 BioMedCLIP；失败时 forward 返回随机嵌入。"""
         try:
-            from transformers import AutoTokenizer, AutoModel  # HuggingFace Transformers 库
-            self.tokenizer = AutoTokenizer.from_pretrained(repo_id)   # 加载文本分词器
-            self.text_model = AutoModel.from_pretrained(repo_id).to(self.device)  # 加载模型并移到设备
-            self._loaded = True   # 标记加载成功
-            # 动态读取实际的隐藏层维度（不同版本/模型的 hidden_size 可能不同）
-            cfg = self.text_model.config   # 获取模型配置
-            if hasattr(cfg, "text_config"):
-                # CLIP 类模型：配置分为 text_config 和 vision_config 两部分
-                self.hidden_dim = cfg.text_config.hidden_size
-            elif hasattr(cfg, "hidden_size"):
-                # BERT 类模型：直接读取 hidden_size
-                self.hidden_dim = cfg.hidden_size
+            import open_clip
+            model, _, _ = open_clip.create_model_and_transforms(
+                f"hf-hub:{repo_id}"
+            )
+            self.tokenizer = open_clip.get_tokenizer(f"hf-hub:{repo_id}")
+            # 只保留文本编码器分支，丢弃视觉分支以节省显存
+            self.text_encoder = model.text.to(self.device)
+            self.hidden_dim = self.text_encoder.transformer.width
+            self._loaded = True
         except Exception as e:
-            # 加载失败（网络问题/依赖未安装等）：退回随机嵌入
-            print(f"[BioMedCLIP] 模型加载失败: {e}。将使用随机嵌入作为替代。")
-            self._loaded = False   # 标记加载失败，forward 时返回随机嵌入
+            print(f"[BioMedCLIP] 加载失败: {e}。将使用随机嵌入替代。")
+            self._loaded = False
 
-    @torch.no_grad()  # 推理时不计算梯度，节省显存
+    @torch.no_grad()
     def forward(self, texts: List[str]) -> torch.Tensor:
         """
-        将文本列表编码为条件嵌入张量。
+        参数:
+          texts: 长度为 B 的文本列表
 
-        参数：
-          texts : 文本字符串列表，长度为 batch size
-
-        返回：
-          形状 (B, seq_len, hidden_dim) 的 float32 张量
-            - 模型正常加载时：返回 BioMedCLIP 的 last_hidden_state
-            - 模型未加载时：返回随机正态噪声（维度相同，仅用于测试流程）
+        返回:
+          (B, context_length, hidden_dim) float32 张量
         """
         if not self._loaded:
-            # 模型不可用时返回形状正确的随机嵌入（保证管道不报错，但语义无意义）
-            B = len(texts)   # batch size = 文本列表长度
+            B = len(texts)
             return torch.randn(B, self.max_length, self.hidden_dim, device=self.device)
 
-        # Tokenize：将文本转为 token ID 序列；pad 到 max_length，超长截断
-        inputs = self.tokenizer(
-            texts,                        # 输入文本列表
-            return_tensors="pt",          # 返回 PyTorch 张量（而非 numpy/list）
-            padding="max_length",         # 补零到 max_length（对齐批次内的所有序列）
-            truncation=True,              # 超长序列截断（保留前 max_length 个 token）
-            max_length=self.max_length,   # 最大序列长度（与 CLIP 标准对齐）
-        ).to(self.device)   # 将 token 张量移到模型所在设备
+        # open_clip tokenizer 直接返回 LongTensor (B, context_length)
+        tokens = self.tokenizer(texts).to(self.device)
 
-        # 提取 last_hidden_state（包含每个 token 的上下文化表示）
-        try:
-            out = self.text_model.text_model(**inputs)  # 调用文本分支（CLIP 模型结构）
-            return out.last_hidden_state   # (B, seq_len, hidden_dim)
-        except Exception:
-            # 部分模型接口不同（如整体 CLIP 模型而非仅文本分支）
-            out = self.text_model(**inputs)  # 尝试调用整体模型接口
-            if hasattr(out, "last_hidden_state"):
-                return out.last_hidden_state  # 直接返回 last_hidden_state
-            # 最后的兜底：将 pooler_output (B, hidden_dim) 扩展为序列维度 (B, max_length, hidden_dim)
-            return out.pooler_output.unsqueeze(1).expand(-1, self.max_length, -1)
+        # 逐步调用 TextTransformer 内部，取 ln_final 之后、text_projection 之前的
+        # 逐 token 表示，形状 (B, context_length, hidden_dim)
+        enc = self.text_encoder
+
+        # 第①步：词元嵌入
+        # token_embedding 是一个 Embedding(vocab_size, dim) 查找表，
+        # 将每个 token id 映射为 dim 维的稠密向量。
+        # 输出形状：(B, L, dim)，其中 L = context_length（默认 77）
+        x = enc.token_embedding(tokens)            # (B, L, dim)
+
+        # 第②步：叠加位置编码
+        # positional_embedding 形状为 (max_seq_len, dim)，是可学习参数。
+        # 用切片 [:L] 保证对任意短于 max_seq_len 的序列都能对齐。
+        # 位置编码与词元嵌入直接相加（Transformer 标准做法），
+        # 为模型注入每个 token 在序列中的绝对位置信息。
+        x = x + enc.positional_embedding[:tokens.shape[1]]
+
+        # 第③步：转置为 LND 布局供 Transformer 处理
+        # open_clip 的 Transformer 期望输入为 (L, B, dim)，即"序列长度在最前"。
+        # permute(1, 0, 2) 将 (B, L, dim) → (L, B, dim)。
+        x = x.permute(1, 0, 2)                    # NLD -> LND（open_clip 约定）
+
+        # 第④步：Transformer 编码
+        # enc.transformer 是一个多层因果自注意力堆栈（Causal Self-Attention）。
+        # attn_mask 是上三角因果掩码（若 enc 上存在则传入，否则传 None）；
+        # 掩码确保每个位置只能看到自身及之前的 token，符合自回归语言模型惯例。
+        # 输出形状不变，仍为 (L, B, dim)。
+        x = enc.transformer(x, attn_mask=getattr(enc, "attn_mask", None))
+
+        # 第⑤步：转置回 NLD 布局
+        # 将 (L, B, dim) → (B, L, dim)，恢复标准批次优先格式，
+        # 以便后续层按批次索引处理。
+        x = x.permute(1, 0, 2)                    # LND -> NLD
+
+        # 第⑥步：最终层归一化
+        # ln_final 是 LayerNorm(dim)，对最后一个维度做归一化。
+        # 此处**故意不做** text_projection（open_clip 默认会再乘一个投影矩阵
+        # 将 dim → embed_dim），因为我们需要的是逐 token 的隐藏状态，
+        # 而非压缩后的全局句向量，以保留更丰富的上下文信息供交叉注意力使用。
+        # 输出形状：(B, L, hidden_dim)
+        x = enc.ln_final(x)                        # (B, L, hidden_dim)
+
+        return x.float()

@@ -9,9 +9,9 @@ M4Fed 统一命令行入口。
   python main.py --mode test
 
   # 单独运行各实验：
-  python main.py --mode ablation    --config configs/m4fed.yaml --dummy
-  python main.py --mode sensitivity --config configs/m4fed.yaml --dummy
-  python main.py --mode cross_site  --config configs/m4fed.yaml --dummy
+  python main.py --mode ablation    --config configs/m4fed.yaml
+  python main.py --mode sensitivity --config configs/m4fed.yaml
+  python main.py --mode cross_site  --config configs/m4fed.yaml
 """
 from __future__ import annotations    # 允许注解中使用尚未定义的类名
 import argparse                       # 命令行参数解析（标准库）
@@ -33,7 +33,6 @@ def parse_args():
       --mode       : 实验模式（test/run_all/ablation/sensitivity/cross_site）
       --config     : YAML 配置文件路径（不存在时退回默认配置）
       --results_dir: 结果保存目录（自动创建）
-      --dummy      : 是否使用极小虚拟数据进行快速冒烟测试（跳过 HuggingFace 下载）
     """
     p = argparse.ArgumentParser(description="M4Fed 联邦学习框架")
     # --mode：选择要执行的实验模式
@@ -47,9 +46,6 @@ def parse_args():
     # --results_dir：所有结果的保存根目录（子实验会在此创建对应子目录）
     p.add_argument("--results_dir", default="results",
                    help="结果保存目录")
-    # --dummy：开关标志，启用后跳过真实数据下载，用随机噪声体积替代
-    p.add_argument("--dummy", action="store_true",
-                   help="使用极小的虚拟数据进行快速冒烟测试")
     return p.parse_args()   # 解析并返回命令行参数
 
 
@@ -73,15 +69,8 @@ def main():
     # 固定全局随机种子（PyTorch / NumPy / random 等），保证可复现性
     set_seed(cfg.training.seed)
 
-    # 根据 --dummy 参数决定 MRI 体积尺寸和数据集 ID 列表
-    if args.dummy:
-        # 虚拟模式：使用极小体积（16³ 体素）和 100 个假数据集 ID
-        mri_shape = (16, 16, 16)                           # 16³ 体素（远小于真实 96³）
-        all_ds_ids = [f"ds{i:06d}" for i in range(100)]   # 100 个假 ID（ds000000~ds000099）
-    else:
-        # 正式模式：从配置文件读取体积尺寸，从 HuggingFace 枚举真实数据集 ID
-        mri_shape = tuple(cfg.data.mri_shape)   # 目标 MRI 分辨率（如 (96, 96, 96)）
-        all_ds_ids = _load_ds_ids(cfg)          # 调用 HuggingFace API 列出真实 ID
+    mri_shape = tuple(cfg.data.mri_shape)   # 目标 MRI 分辨率（如 (96, 96, 96)）
+    all_ds_ids = _load_ds_ids(cfg)          # 调用 HuggingFace API 列出真实 ID
 
     # 确保结果根目录存在（exist_ok=True：目录已存在时不报错）
     os.makedirs(args.results_dir, exist_ok=True)
@@ -106,29 +95,34 @@ def main():
         sys.argv = [sys.argv[0],
                     "--config", args.config,       # 传入配置文件路径
                     "--results_dir", args.results_dir]  # 传入结果目录
-        if args.dummy:
-            sys.argv.append("--dummy")   # 若开启虚拟模式则追加 --dummy 标志
         run_all_main()   # 调用 run_all_baselines 的 main 函数
 
     elif args.mode == "ablation":
         # 消融实验：逐一移除 M4Fed 的各关键组件，验证每个组件的贡献
         from experiments.ablation import run_ablation
-        task_specs = {"age": {"type": "regression", "n_classes": 1}}   # 年龄回归任务
+        task_specs = {
+            "age":           {"type": "regression",     "n_classes": 1},
+            "health_status": {"type": "classification", "n_classes": 2},  # run_ablation 内更新 n_classes
+            "race":          {"type": "classification", "n_classes": 5},  # run_ablation 内更新 n_classes
+        }
         run_ablation(args, cfg, all_ds_ids, mri_shape, task_specs, args.results_dir)
 
     elif args.mode == "sensitivity":
         # 超参数敏感性分析：扫描合成比例/MedMD 学习率/Non-IID 程度
         from experiments.sensitivity import run_sensitivity
-        task_specs = {"age": {"type": "regression", "n_classes": 1}}   # 年龄回归任务
+        task_specs = {
+            "age":           {"type": "regression",     "n_classes": 1},
+            "health_status": {"type": "classification", "n_classes": 2},  # run_sensitivity 内更新 n_classes
+            "race":          {"type": "classification", "n_classes": 5},  # run_sensitivity 内更新 n_classes
+        }
         run_sensitivity(args, cfg, all_ds_ids, mri_shape, task_specs, args.results_dir)
 
     elif args.mode == "cross_site":
-        # 跨站点泛化实验：在未见过的采集中心数据上评估服务器端 NeuroFM
+        # 跨站点泛化实验：在未见过的采集中心数据上评估服务器端领域模型（SwinMultiTask）
         from experiments.cross_site import run_cross_site
         from data.openmind_dataset import build_node_datasets, OpenMindDataset, make_openmind_sample_loader
 
-        # 非 dummy 模式：创建真实数据加载函数（从 HuggingFace 惰性下载 NIfTI + 元数据）
-        sample_loader_fn = None if args.dummy else make_openmind_sample_loader(
+        sample_loader_fn = make_openmind_sample_loader(
             cfg.data.hf_dataset_id,                  # HuggingFace 数据集仓库 ID
             cache_dir=cfg.data.cache_dir or None,    # 本地缓存目录
             max_cache_gb=cfg.data.max_cache_gb,      # LRU 缓存容量上限（GB）
@@ -143,14 +137,10 @@ def main():
             mri_shape=mri_shape,                                 # MRI 目标分辨率
             seed=cfg.data.seed,                                  # 数据划分随机种子
             sample_loader_fn=sample_loader_fn,                   # 样本加载函数
-            dummy_mode=args.dummy,                               # 是否虚拟模式
-            n_dummy_per_ds=5,                                    # 虚拟样本数/数据集
-            n_public_max=cfg.data.n_public_ds_max,              # 公开数据集上限
         )
         # nd["cross"]["all"] 包含所有跨站点子数据集的样本（不分 train/test，全部用于评估）
         cross_ds = nd["cross"]["all"]
-        # 期望的 M4Fed 服务器端 NeuroFM 权重路径（M4Fed 训练完成后生成）
-        model_path = os.path.join(args.results_dir, "m4fed", "server_neurofm.pt")
+        model_path = os.path.join(args.results_dir, "m4fed", "server_swin.pt")
         run_cross_site(args, cfg, cross_ds, args.results_dir, model_path)
 
     # ------------------------------------------------------------------

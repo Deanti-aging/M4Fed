@@ -4,8 +4,8 @@ M4Fed 消融实验（Ablation Study）。
 验证三个组件的有效性（通过逐一移除）：
   变体 A：w/o server public data    —— 服务器公开数据集置空，验证公开数据的作用
   变体 B：w/o TabPFN                —— 禁用表格补全（缺失值保持 NaN），验证 TabPFN 的作用
-  变体 C：random-init NeuroFM      —— NeuroFM 随机初始化（不使用预训练权重），
-                                      验证预训练骨干的作用
+  变体 C：random-init SwinUNETR    —— SwinUNETR 骨干随机初始化（不使用预训练权重），
+                                      验证预训练骨干对脑年龄预测的贡献
 
 每个变体都在相同的数据集划分和超参数下运行完整的 M4Fed 协议，
 唯一的区别是对应组件被移除或替换（控制变量法）。
@@ -57,15 +57,15 @@ def run_ablation(args, cfg, all_ds_ids, mri_shape, task_specs, results_dir):
     每个变体的运行流程：
       1. 深拷贝基础配置（避免变体间相互影响）
       2. 深拷贝基础数据集划分（保证相同的数据分布）
-      3. 修改对应组件（公开数据/TabPFN/NeuroFM 初始化）
+      3. 修改对应组件（公开数据/TabPFN/SwinUNETR 初始化）
       4. 运行完整 M4Fed 协议
       5. 记录结果
 
     参数：
-      args       : 命令行参数（.dummy 标志等）
+      args       : 命令行参数
       cfg        : 基础 M4FedConfig（所有变体的起点）
       all_ds_ids : 所有子数据集 ID 列表
-      mri_shape  : MRI 体积目标尺寸（dummy 模式为 16³，正式模式来自配置）
+      mri_shape  : MRI 体积目标尺寸（来自配置）
       task_specs : 任务规格字典（预测任务的配置）
       results_dir: 结果保存根目录
 
@@ -75,12 +75,15 @@ def run_ablation(args, cfg, all_ds_ids, mri_shape, task_specs, results_dir):
     device = cfg.training.device                                      # 计算设备
     ablation_out = ensure_dir(os.path.join(results_dir, "ablation"))  # 创建消融实验结果目录
 
-    # 非 dummy 模式下，创建真实数据加载函数（从 HuggingFace 下载 NIfTI + 元数据）
-    sample_loader_fn = None if args.dummy else make_openmind_sample_loader(
+    sample_loader_fn = make_openmind_sample_loader(
         cfg.data.hf_dataset_id,                  # HuggingFace 数据集仓库 ID
         cache_dir=cfg.data.cache_dir or None,    # 本地缓存目录
         max_cache_gb=cfg.data.max_cache_gb,      # 最大缓存大小（GB）
     )
+    # 用实际类别数更新 task_specs（覆盖 main.py 中的占位 n_classes）
+    for field, n in getattr(sample_loader_fn, "n_classes", {}).items():
+        if field in task_specs and n > 0:
+            task_specs[field]["n_classes"] = n
 
     # 构建基础节点数据集（所有消融变体共用相同的数据集划分，保证公平对比）
     node_datasets = build_node_datasets(
@@ -92,9 +95,6 @@ def run_ablation(args, cfg, all_ds_ids, mri_shape, task_specs, results_dir):
         mri_shape=mri_shape,                                  # MRI 目标分辨率
         seed=cfg.data.seed,                                   # 数据划分随机种子
         sample_loader_fn=sample_loader_fn,                    # 样本加载函数
-        dummy_mode=args.dummy,                                # 是否虚拟模式
-        n_dummy_per_ds=2 if args.dummy else 10,              # 每个虚拟数据集的样本数
-        n_public_max=cfg.data.n_public_ds_max,               # 公开数据集最大数量
     )
 
     ablation_results = {}   # 收集各变体的实验结果
@@ -109,7 +109,6 @@ def run_ablation(args, cfg, all_ds_ids, mri_shape, task_specs, results_dir):
     cfg_a = copy.deepcopy(cfg)          # 深拷贝配置（变体 A 独立）
     nd_a = copy.deepcopy(node_datasets)  # 深拷贝数据集（变体 A 独立）
     nd_a["server_public"]["train"].samples = []   # 清空公开训练集（模拟无公开数据）
-    nd_a["server_public"]["test"].samples = []    # 清空公开测试集
     s, c = _build(cfg_a, nd_a, device)   # 构建参与者（含清空公开数据的服务器）
     ablation_results["w/o_public"] = run_m4fed(
         s, c, cfg_a, task_specs, os.path.join(ablation_out, "wo_public"))   # 运行并记录
@@ -130,20 +129,20 @@ def run_ablation(args, cfg, all_ds_ids, mri_shape, task_specs, results_dir):
         s, c, cfg_b, task_specs, os.path.join(ablation_out, "wo_tabpfn"))
 
     # ------------------------------------------------------------------
-    # 变体 C：NeuroFM 随机初始化（验证预训练骨干权重对领域预测的重要性）
-    # 实现方式：Monkey-patch Server.build_models，强制 random_init_neurofm=True
-    # 效果：NeuroFM 骨干从随机权重出发（而非预训练权重），类似 FedAvg 的场景
+    # 变体 C：SwinUNETR 随机初始化（验证预训练骨干权重对领域预测的重要性）
+    # 实现方式：Monkey-patch Server.build_models，强制 random_init_swin=True
+    # 效果：SwinUNETR 骨干从随机权重出发（而非 MONAI 预训练权重），作为消融对照
     # ------------------------------------------------------------------
-    print("[消融] 变体 C：NeuroFM 随机初始化（无预训练骨干）")
+    print("[消融] 变体 C：SwinUNETR 随机初始化（无预训练骨干）")
     set_seed(cfg.training.seed)          # 重置随机种子
     cfg_c = copy.deepcopy(cfg)           # 深拷贝配置（变体 C 独立）
     s, c = _build(cfg_c, node_datasets, device)   # 构建参与者（使用原始数据集）
     original_build = Server.build_models  # 保存原始 build_models 方法（实验后恢复）
     def _random_build(self, ts, **kw):
-        """强制 random_init_neurofm=True 的 build_models 替代版本（消融专用）。"""
-        original_build(self, ts, random_init_neurofm=True)   # 覆盖为随机初始化
-    Server.build_models = _random_build   # 临时替换为随机初始化版本
-    ablation_results["random_init_neurofm"] = run_m4fed(
+        """强制 random_init_swin=True 的 build_models 替代版本（消融专用）。"""
+        original_build(self, ts, random_init_swin=True)
+    Server.build_models = _random_build
+    ablation_results["random_init_swin"] = run_m4fed(
         s, c, cfg_c, task_specs, os.path.join(ablation_out, "random_init"))
     Server.build_models = original_build   # 恢复原始方法（避免影响后续实验）
 
@@ -177,13 +176,17 @@ def run_ablation(args, cfg, all_ds_ids, mri_shape, task_specs, results_dir):
 
 if __name__ == "__main__":
     import argparse   # 命令行参数解析
+    from data.openmind_dataset import list_openmind_ds_ids
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="configs/m4fed.yaml")   # 配置文件路径
-    p.add_argument("--dummy", action="store_true")              # 虚拟模式标志
     p.add_argument("--results_dir", default="results")          # 结果保存目录
     args = p.parse_args()   # 解析参数
     cfg = load_config(args.config)   # 加载配置
-    all_ds_ids = [f"ds{i:06d}" for i in range(100)] if args.dummy else []  # 虚拟/真实 ID
-    mri_shape = (16, 16, 16) if args.dummy else tuple(cfg.data.mri_shape)  # MRI 分辨率
-    task_specs = {"age": {"type": "regression", "n_classes": 1}}  # 任务规格（年龄回归）
+    all_ds_ids = list_openmind_ds_ids(cfg.data.hf_dataset_id)
+    mri_shape = tuple(cfg.data.mri_shape)
+    task_specs = {
+        "age":           {"type": "regression",     "n_classes": 1},
+        "health_status": {"type": "classification", "n_classes": 2},
+        "race":          {"type": "classification", "n_classes": 5},
+    }
     run_ablation(args, cfg, all_ds_ids, mri_shape, task_specs, args.results_dir)

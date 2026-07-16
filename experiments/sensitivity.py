@@ -58,31 +58,27 @@ def _build(cfg, node_datasets, device):
     return server, clients   # 返回参与者元组
 
 
-def _base_datasets(cfg, all_ds_ids, mri_shape, dummy, n_dummy_per_ds=2):
+def _base_datasets(cfg, all_ds_ids, mri_shape):
     """
     构建基础节点数据集（作为敏感性分析各扫描点的共同起点）。
 
     各扫描点通过深拷贝（copy.deepcopy）此数据集后修改，避免扫描点之间数据相互污染。
-    dummy=False 时从 HuggingFace 下载真实 OpenMind 样本（NIfTI + 元数据）。
 
     参数：
-      cfg           : M4FedConfig（用于读取 hf_dataset_id、cache_dir 等数据参数）
-      all_ds_ids    : 所有可用的子数据集 ID 列表
-      mri_shape     : MRI 体积目标分辨率（元组）
-      dummy         : 是否虚拟模式（True 时跳过真实数据下载，生成随机张量）
-      n_dummy_per_ds: 虚拟模式下每个数据集生成的样本数（默认 2）
+      cfg        : M4FedConfig（用于读取 hf_dataset_id、cache_dir 等数据参数）
+      all_ds_ids : 所有可用的子数据集 ID 列表
+      mri_shape  : MRI 体积目标分辨率（元组）
 
     返回：
       node_datasets 字典（keys: "server_private", "server_public", "client_0", "client_1"）
     """
-    # 非虚拟模式：创建 HuggingFace 样本加载函数（下载 NIfTI + CSV 元数据）
-    sample_loader_fn = None if dummy else make_openmind_sample_loader(
+    sample_loader_fn = make_openmind_sample_loader(
         cfg.data.hf_dataset_id,                 # HuggingFace 数据集仓库 ID
         cache_dir=cfg.data.cache_dir or None,   # 本地缓存目录（None 用默认缓存）
         max_cache_gb=cfg.data.max_cache_gb,     # 最大缓存容量（GB）
     )
     # 构建节点数据集（服务器 + 2 客户端；n_clients=2 固定）
-    return build_node_datasets(
+    nd = build_node_datasets(
         all_ds_ids=all_ds_ids,                              # 所有数据集 ID
         n_cross=cfg.data.n_cross_ds,                         # 公开数据集数量
         n_private_per_node=cfg.data.n_private_ds_per_node,  # 每节点私有数据集数量
@@ -91,10 +87,8 @@ def _base_datasets(cfg, all_ds_ids, mri_shape, dummy, n_dummy_per_ds=2):
         mri_shape=mri_shape,                                 # MRI 目标分辨率
         seed=cfg.data.seed,                                  # 数据划分随机种子
         sample_loader_fn=sample_loader_fn,                   # 样本加载函数
-        dummy_mode=dummy,                                    # 是否虚拟模式
-        n_dummy_per_ds=n_dummy_per_ds,                      # 虚拟样本数/数据集
-        n_public_max=cfg.data.n_public_ds_max,              # 公开数据集上限
     )
+    return nd, sample_loader_fn   # 同时返回 sample_loader_fn，供调用方获取 n_classes
 
 
 def dirichlet_resplit(node_datasets: dict, alpha: float, seed: int) -> dict:
@@ -166,7 +160,7 @@ def run_sensitivity(args, cfg, all_ds_ids, mri_shape, task_specs, results_dir):
     每个扫描点均独立运行完整的 M4Fed 三阶段协议。
 
     参数：
-      args       : 命令行参数（.dummy 等标志）
+      args       : 命令行参数
       cfg        : 基础 M4FedConfig（所有扫描点的起点，不直接修改）
       all_ds_ids : 所有可用子数据集 ID 列表
       mri_shape  : MRI 体积目标尺寸（元组）
@@ -178,10 +172,13 @@ def run_sensitivity(args, cfg, all_ds_ids, mri_shape, task_specs, results_dir):
     """
     sens_out = ensure_dir(os.path.join(results_dir, "sensitivity"))  # 创建敏感性分析结果目录
     device = cfg.training.device   # 计算设备
-    dummy = args.dummy             # 虚拟模式标志
 
     # 构建基础节点数据集（各扫描点深拷贝此数据集，避免相互污染）
-    nd_base = _base_datasets(cfg, all_ds_ids, mri_shape, dummy)
+    nd_base, sample_fn = _base_datasets(cfg, all_ds_ids, mri_shape)
+    # 用实际类别数更新 task_specs（覆盖 main.py 中的占位 n_classes）
+    for field, n in getattr(sample_fn, "n_classes", {}).items():
+        if field in task_specs and n > 0:
+            task_specs[field]["n_classes"] = n
 
     all_sensitivity_results = {}   # 收集所有扫描点的结果
 
@@ -265,15 +262,17 @@ def run_sensitivity(args, cfg, all_ds_ids, mri_shape, task_specs, results_dir):
 
 if __name__ == "__main__":
     import argparse   # 命令行参数解析
+    from data.openmind_dataset import list_openmind_ds_ids
     p = argparse.ArgumentParser()
-    p.add_argument("--config", default="configs/m4fed.yaml")         # 配置文件路径
-    p.add_argument("--dummy", action="store_true", help="使用虚拟数据快速验证")  # 虚拟模式
-    p.add_argument("--results_dir", default="results")                # 结果保存目录
+    p.add_argument("--config", default="configs/m4fed.yaml")   # 配置文件路径
+    p.add_argument("--results_dir", default="results")          # 结果保存目录
     args = p.parse_args()   # 解析命令行参数
     cfg = load_config(args.config)   # 加载 M4FedConfig 配置
-    # 虚拟模式：生成 100 个假 ID；正式模式：从 HuggingFace 枚举真实 ID
-    all_ds_ids = [f"ds{i:06d}" for i in range(100)] if args.dummy else []
-    # 虚拟模式用 16³ 分辨率（快速验证），正式模式用配置中的分辨率
-    mri_shape = (16, 16, 16) if args.dummy else tuple(cfg.data.mri_shape)
-    task_specs = {"age": {"type": "regression", "n_classes": 1}}   # 仅评估年龄回归任务
+    all_ds_ids = list_openmind_ds_ids(cfg.data.hf_dataset_id)
+    mri_shape = tuple(cfg.data.mri_shape)
+    task_specs = {
+        "age":           {"type": "regression",     "n_classes": 1},
+        "health_status": {"type": "classification", "n_classes": 2},
+        "race":          {"type": "classification", "n_classes": 5},
+    }
     run_sensitivity(args, cfg, all_ds_ids, mri_shape, task_specs, args.results_dir)

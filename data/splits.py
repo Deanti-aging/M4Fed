@@ -10,23 +10,20 @@ def assign_ds_splits(
     n_private_per_node: int,
     n_clients: int,
     seed: int = 42,
-    n_public_max: Optional[int] = None,
 ) -> Dict[str, List[str]]:
     """
     将所有子数据集 ID 随机分配到以下角色（各角色之间互不重叠）：
 
-      'cross'               : 跨站点评估集（要求年龄 AND 性别字段覆盖率高，在调用前预过滤）
+      'cross'               : 跨站点评估集（要求年龄字段非空，在调用前预过滤）
       'server_private'      : 服务器私有数据集
       'client_0_private'    : 客户端 0 的私有数据集
       'client_1_private'    : 客户端 1 的私有数据集（以此类推）
-      'public'              : 剩余数据集中最多 n_public_max 个，作为服务器的公开数据用于
-                               MedMD 热身预训练（其余剩余数据集不分配给任何角色）
+      'public'              : 剩余全部数据集，作为服务器的公开数据用于 MedMD 热身预训练
 
     分配顺序（先到先得，按 pool 剩余量分配）：
       1. 从随机打乱的池中取前 n_cross 个 -> cross
       2. 取接下来 n_private_per_node * (1 + n_clients) 个 -> 私有（服务器 + 各客户端）
-      3. 剩余中最多取 n_public_max 个 -> public（n_public_max 为 None 时取剩余全部，
-         即旧版行为；OpenMind 全量约 964GiB，在磁盘有限的机器上不应取 None）
+      3. 剩余全部 -> public
 
     注意：数据质量预筛选（年龄/性别非空率检查）应在调用此函数之前完成，
     此函数只负责随机分配，不做质量过滤。
@@ -37,7 +34,6 @@ def assign_ds_splits(
       n_private_per_node : 每个节点（服务器 + 每个客户端）的私有数据集数量
       n_clients          : 客户端数量
       seed               : 随机种子（保证可复现性）
-      n_public_max       : public 角色最多分配的子数据集数量；None 表示不限制（旧版行为）
 
     返回：
       字典，键为角色名，值为对应的子数据集 ID 列表
@@ -66,9 +62,7 @@ def assign_ds_splits(
         start = n_private_per_node * (i + 1)                       # 第 i 个客户端的起始下标
         result[f"client_{i}_private"] = private_pool[start: start + n_private_per_node]  # 切片分配
 
-    # 剩余中最多取 n_public_max 个作为公开数据，避免无上限地占满磁盘
-    # n_public_max 为 None 时取全部剩余（旧版行为，OpenMind 全量约 964GiB，不建议使用）
-    result["public"] = pool if n_public_max is None else pool[:n_public_max]
+    result["public"] = pool   # 剩余全部数据集，磁盘空间由 LRU 缓存管理
     return result   # 返回包含所有角色分配结果的字典
 
 

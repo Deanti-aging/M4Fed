@@ -13,7 +13,7 @@ class BaseParticipant:
 
     封装了：
       - 配置和设备信息
-      - 模型引用（MedMD 生成模型 + NeuroFM 领域预测模型）
+      - 模型引用（MedMD 生成模型 + SwinMultiTask 领域预测模型）
       - DataLoader 引用
       - 模型权重的获取/设置接口（供联邦聚合时使用）
 
@@ -35,27 +35,21 @@ class BaseParticipant:
         self.cfg = cfg                             # 保存全局配置对象（供子类访问超参数）
         self.device = device                        # 保存计算设备字符串
         self.medmd = None                           # MedMD 生成模型实例（由 build_models 初始化）
-        self.neurofm = None                         # NeuroFMMultiTask 领域预测模型实例
+        self.swin = None                            # SwinMultiTask 领域预测模型实例
         self.train_loader: Optional[DataLoader] = None  # 训练数据加载器（子类初始化）
         self.test_loader: Optional[DataLoader] = None   # 测试数据加载器（子类初始化）
 
     # ---------------------------------------------------------------------- #
-    #  NeuroFM 权重接口（用于联邦聚合时传递领域模型权重）                         #
+    #  SwinMultiTask 权重接口（用于联邦聚合时传递领域模型权重）                    #
     # ---------------------------------------------------------------------- #
 
-    def get_neurofm_state(self) -> dict:
-        """
-        获取 NeuroFM 的完整状态字典（深拷贝）。
-        深拷贝确保返回的字典与模型当前权重独立，后续修改不会相互影响。
-        """
-        return copy.deepcopy(self.neurofm.state_dict())  # 深拷贝保证外部无法意外修改模型权重
+    def get_swin_state(self) -> dict:
+        """获取 SwinMultiTask 的完整状态字典（深拷贝），供联邦聚合使用。"""
+        return copy.deepcopy(self.swin.state_dict())
 
-    def set_neurofm_state(self, state: dict, strict: bool = False) -> None:
-        """
-        将状态字典加载到 NeuroFM（strict=False 允许部分加载）。
-        联邦聚合后，服务器将聚合权重分发给各参与方时调用此方法。
-        """
-        self.neurofm.load_state_dict(state, strict=strict)  # 将 state 中的权重写入 NeuroFM
+    def set_swin_state(self, state: dict, strict: bool = False) -> None:
+        """将聚合后的状态字典加载到 SwinMultiTask（strict=False 允许部分加载）。"""
+        self.swin.load_state_dict(state, strict=strict)
 
     def get_medmd_unet_state(self) -> dict:
         """

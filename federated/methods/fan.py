@@ -3,7 +3,7 @@ FAN 基线（Federated Augmentation Network）。
 
 与 M4Fed 的关键区别：
   - 3 个客户端，无服务器聚合（去中心化结构）
-  - 每个客户端独立拥有 MedMD 和 NeuroFM（均随机初始化）
+  - 每个客户端独立拥有 MedMD 和 SwinMultiTask（均随机初始化）
   - 客户端间通过交换合成数据（而非模型权重）来共享知识
   - 使用 MONAI 数据增强而非条件合成（更简单的数据扩充策略）
 
@@ -11,7 +11,7 @@ FAN 基线（Federated Augmentation Network）。
   1. 热身阶段：各客户端用增强后的本地数据训练生成和领域模型
   2. 联邦循环：各客户端生成合成数据，广播给其他客户端；
                每个客户端在接收的合成数据上微调生成模型
-  3. 本地训练：各客户端合成数据并用于微调领域模型（NeuroFM）
+  3. 本地训练：各客户端合成数据并用于微调领域模型（SwinMultiTask）
 """
 from __future__ import annotations    # 允许注解中使用尚未定义的类名
 import copy, math, os                 # copy：深拷贝；math：ceil 向上取整；os：路径拼接
@@ -21,7 +21,7 @@ from typing import List               # 类型注解：客户端列表
 from torch.utils.data import ConcatDataset   # PyTorch：数据集合并工具
 
 from training.medmd_trainer import MedMDTrainer     # MedMD 生成模型训练器
-from training.neurofm_trainer import NeuroFMTrainer  # NeuroFM 预测模型训练器
+from training.swin_trainer import SwinTrainer         # SwinMultiTask 预测模型训练器
 from evaluation.metrics import compute_domain_metrics  # 领域预测评估指标
 from data.openmind_dataset import OpenMindDataset, make_dataloader  # 数据集和 DataLoader 工厂
 from utils.io_utils import save_csv, save_model, ensure_dir  # 文件保存工具
@@ -85,7 +85,7 @@ def run_fan(server, clients: List, cfg, task_specs: dict, results_dir: str) -> d
 
     # FAN 每个客户端独立拥有模型，均随机初始化（无预训练骨干，对比 M4Fed 的预训练初始化）
     for c in clients:
-        c.build_models(task_specs, random_init_neurofm=True)   # 骨干随机初始化
+        c.build_models(task_specs, random_init_swin=True)
 
     _train_t0 = time.perf_counter()   # 记录训练总开始时间
 
@@ -96,20 +96,18 @@ def run_fan(server, clients: List, cfg, task_specs: dict, results_dir: str) -> d
     # 为每个客户端创建带 MONAI 数据增强的 DataLoader（随机翻转等 3D 增强）
     aug_loaders = [_augment_loader(c.train_loader, cfg) for c in clients]
 
-    # 为每个客户端创建生成模型（MedMD）和领域模型（NeuroFM）的训练器
-    client_gen_trainers = []    # 生成模型（MedMD）训练器列表（每个客户端独立）
-    client_dom_trainers = []    # 领域模型（NeuroFM）训练器列表（每个客户端独立）
+    # 为每个客户端创建生成模型（MedMD）和领域模型（SwinMultiTask）的训练器
+    client_gen_trainers = []
+    client_dom_trainers = []
     for i, c in enumerate(clients):
-        # 为客户端 i 创建 MedMD 训练器（不使用 QLoRA，热身阶段完整训练）
         g = MedMDTrainer(c.medmd, device=device, lr=cfg.training.lr_medmd,
                          mixed_precision=cfg.training.mixed_precision, use_qlora=False)
-        # 为客户端 i 创建 NeuroFM 训练器
-        d = NeuroFMTrainer(c.neurofm, device=device, lr=cfg.training.lr_neurofm,
-                           mixed_precision=cfg.training.mixed_precision, use_qlora=False)
-        g.train_epoch(aug_loaders[i])   # 在增强数据上训练 MedMD 1 epoch（热身）
-        d.train_epoch(aug_loaders[i])   # 在增强数据上训练 NeuroFM 1 epoch（热身）
-        client_gen_trainers.append(g)   # 保存生成模型训练器（联邦循环阶段继续使用）
-        client_dom_trainers.append(d)   # 保存领域模型训练器（本地训练阶段使用）
+        d = SwinTrainer(c.swin, device=device, lr=cfg.training.lr_swin,
+                        mixed_precision=cfg.training.mixed_precision, use_qlora=False)
+        g.train_epoch(aug_loaders[i])
+        d.train_epoch(aug_loaders[i])
+        client_gen_trainers.append(g)
+        client_dom_trainers.append(d)
 
     # 初始化损失记录字典（联邦循环阶段的损失）
     all_losses = {f"client_{c.client_id}": [] for c in clients}
@@ -155,7 +153,7 @@ def run_fan(server, clients: List, cfg, task_specs: dict, results_dir: str) -> d
             all_losses[f"client_{c.client_id}"].append({"round": rnd, "loss": loss})   # 记录损失
 
     # ------------------------------------------------------------------ #
-    # 阶段 3：本地训练（Local Training）—— 合成增强数据，训练领域模型 NeuroFM   #
+    # 阶段 3：本地训练（Local Training）—— 合成增强数据，训练领域模型 SwinMultiTask #
     # ------------------------------------------------------------------ #
     print("[FAN] === 本地训练阶段 ===")
     local_losses = {f"client_{c.client_id}": [] for c in clients}   # 本地训练阶段损失
@@ -173,26 +171,23 @@ def run_fan(server, clients: List, cfg, task_specs: dict, results_dir: str) -> d
         )
         aug_base = aug_loaders[i].dataset   # 客户端 i 的本地增强数据集
         syn_ds = OpenMindDataset(syn, tuple(cfg.data.mri_shape))   # 合成数据包装为 Dataset
-        # 合并增强本地数据和合成数据，用于训练领域预测模型 NeuroFM
         merged_loader = make_dataloader(
             ConcatDataset([aug_base, syn_ds]),
             cfg.training.batch_size, shuffle=True, seed=cfg.training.seed,
         )
-        # 本地训练 local_rounds 轮（每轮 1 epoch）
         for ep in range(cfg.federated.local_rounds):
-            loss = client_dom_trainers[i].train_epoch(merged_loader)   # 训练 NeuroFM 1 epoch
-            local_losses[f"client_{c.client_id}"].append({"round": ep, "loss": loss})   # 记录损失
+            loss = client_dom_trainers[i].train_epoch(merged_loader)
+            local_losses[f"client_{c.client_id}"].append({"round": ep, "loss": loss})
 
     record_timing("fan/train", time.perf_counter() - _train_t0)   # 记录训练总耗时
 
     # ---- 评估阶段 ----
-    _eval_t0 = time.perf_counter()   # 记录评估开始时间
-    results = {}   # 各客户端的评估指标
+    _eval_t0 = time.perf_counter()
+    results = {}
     for c in clients:
-        # 创建评估用 Trainer（lr=0，只推理不更新参数）
-        t = NeuroFMTrainer(c.neurofm, device=device, lr=0, mixed_precision=False)
-        y_true, y_pred = t.evaluate(c.test_loader)   # 在测试集上推理
-        results[f"client_{c.client_id}"] = compute_domain_metrics(y_true, y_pred)   # 计算指标
+        t = SwinTrainer(c.swin, device=device, lr=0, mixed_precision=False)
+        y_true, y_pred = t.evaluate(c.test_loader)
+        results[f"client_{c.client_id}"] = compute_domain_metrics(y_true, y_pred)
     record_timing("fan/eval", time.perf_counter() - _eval_t0)   # 记录评估耗时
 
     # 计算跨客户端指标的均值和标准差
@@ -209,7 +204,7 @@ def run_fan(server, clients: List, cfg, task_specs: dict, results_dir: str) -> d
         save_csv(pd.DataFrame(losses_combined), os.path.join(out, f"{key}_losses.csv"))
         save_csv(pd.DataFrame([results[key]]), os.path.join(out, f"{key}_metrics.csv"))
         if cfg.eval.save_model:
-            save_model(c.neurofm, os.path.join(out, f"client_{c.client_id}_neurofm.pt"))
+            save_model(c.swin, os.path.join(out, f"client_{c.client_id}_swin.pt"))
     return results   # 返回完整结果字典
 
 

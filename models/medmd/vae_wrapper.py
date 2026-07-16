@@ -48,6 +48,7 @@ def load_vae(
     try:
         from generative.networks.nets import AutoencoderKL  # MONAI 生成模型库
         # 架构参数与 MONAI/brats_mri_generative_diffusion 的 train_autoencoder.json 完全对齐
+        # 该 VAE 关闭了所有注意力机制（空间注意力 + 编码/解码器非局部注意力），目的是与 MONAI/brats_mri_generative_diffusion 预训练权重的配置保持一致。
         vae = AutoencoderKL(
             spatial_dims=spatial_dims,                             # 3D 空间（处理体积数据）
             in_channels=in_channels,                               # 输入通道（灰度 MRI = 1）
@@ -59,7 +60,7 @@ def load_vae(
             with_decoder_nonlocal_attn=False,                      # 解码器不使用非局部注意力
             num_res_blocks=2,                                      # 每个分辨率级别的残差块数
             norm_num_groups=32,                                    # 组归一化的分组数
-            norm_eps=1e-6,                                         # 归一化层的数值稳定系数
+            norm_eps=1e-6,                                         # 归一化层的数值稳定系数，其作用是在分母中加上一个极小值，防止方差为零时出现除以零的数值错误。1e-6 是一个常见的标准选择，足够小不影响计算精度，又足够大避免数值不稳定。
         )
         # 尝试从 HuggingFace Hub 下载预训练权重（首次下载后本地缓存）
         if repo_id:
@@ -126,6 +127,9 @@ class _MinimalVAE(nn.Module):
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """编码：返回均值向量（丢弃方差部分，简化实现）。"""
+        # 这两行是 VAE（变分自编码器）编码器的简化推断逻辑：
+        # 背景：编码器输出的通道数是 lat_ch * 2，刻意设计成两倍——按照 VAE 的标准做法，前半通道代表 均值 μ，后半通道代表 对数方差 log σ²。
+        # 为什么这样做？完整 VAE 推断时应该用重参数化采样 z = μ + ε·σ（ε 是随机噪声），引入随机性。但这里是推断/测试阶段的简化：直接用均值 μ 作为确定性的潜向量，避免随机性，让编码结果稳定可复现。这是一种常见的 VAE 推断惯例。
         h = self.encoder(x)               # 通过编码器得到 2×lat_ch 通道的特征图
         mu, _ = h.chunk(2, dim=1)         # 沿通道维度分成两半：前半为均值（μ），后半为对数方差
         return mu                          # 只返回均值向量（简化：忽略重参数化采样）

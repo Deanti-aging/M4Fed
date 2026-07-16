@@ -5,7 +5,7 @@ QLoRA 工具：为模型的线性层添加 4-bit LoRA 适配器（使用 PEFT �
   QLoRA（Quantized Low-Rank Adaptation）将大型预训练模型量化为 4-bit，
   同时只微调少量低秩适配器参数，大幅降低微调所需的内存和通信开销。
 
-  在 M4Fed 中，客户端使用 QLoRA 微调 NeuroFM 骨干和 MedMD U-Net，
+  在 M4Fed 中，客户端使用 QLoRA 微调 SwinUNETR 骨干和 MedMD U-Net，
   减少本地训练的计算负担。
 
 退回策略：
@@ -36,7 +36,7 @@ def apply_qlora(
       实际学习率缩放为 lora_alpha / r。
 
     参数：
-      model          : 要应用 LoRA 的模型（通常是 U-Net 或 NeuroFM 骨干）
+      model          : 要应用 LoRA 的模型（通常是 U-Net 或 SwinUNETR 骨干）
       r              : LoRA 低秩矩阵的秩（越小参数量越少，表达能力越弱）
       lora_alpha     : 缩放系数（影响有效学习率）
       lora_dropout   : LoRA 层的 Dropout 比例（防止过拟合）

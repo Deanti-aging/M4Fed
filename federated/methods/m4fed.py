@@ -17,7 +17,7 @@ M4Fed：完整的联邦学习协议（论文提出的方法）。
 
 阶段 3 — 本地训练（Local Training）：
   ① 每个节点（服务器+客户端）用自身 MedMD 在本地私有数据上合成样本
-  ② 将合成样本与本地真实数据混合，训练 NeuroFM（客户端使用 QLoRA）
+  ② 将合成样本与本地真实数据混合，训练 SwinMultiTask（客户端使用 QLoRA）
 """
 from __future__ import annotations    # 允许注解中使用尚未定义的类名
 import math                            # 数学工具：ceil（向上取整，计算合成数量）
@@ -27,7 +27,7 @@ from typing import Dict, List, Tuple   # 类型注解工具
 
 from models.tabpfn_wrapper import TabPFNImputer            # TabPFN 表格缺失值填充器
 from training.medmd_trainer import MedMDTrainer             # MedMD 生成模型训练器
-from training.neurofm_trainer import NeuroFMTrainer         # NeuroFM 预测模型训练器
+from training.swin_trainer import SwinTrainer                # SwinMultiTask 预测模型训练器
 from evaluation.metrics import (                            # 评估指标函数
     compute_domain_metrics, compute_image_metrics, compute_bias_analysis
 )
@@ -66,11 +66,10 @@ def run_m4fed(
     method = "m4fed"                         # 方法名（用于目录命名和计时标签）
     out = ensure_dir(os.path.join(results_dir, method))   # 创建结果保存目录
 
-    # ---- 初始化所有节点的模型（使用预训练 NeuroFM 骨干，体现迁移学习优势）----
-    # M4Fed 使用预训练 NeuroFM（random_init=False），这是与 FedAvg/FedProx 的重要区别
-    server.build_models(task_specs, random_init_neurofm=False)   # 服务器用预训练骨干
+    # M4Fed 使用预训练 SwinUNETR 骨干（random_init=False），这是与 FedAvg/FedProx 的重要区别
+    server.build_models(task_specs, random_init_swin=False)
     for c in clients:
-        c.build_models(task_specs, random_init_neurofm=False)    # 客户端均用预训练骨干
+        c.build_models(task_specs, random_init_swin=False)
 
     _train_t0 = time.perf_counter()   # 记录训练总开始时间
 
@@ -228,36 +227,35 @@ def run_m4fed(
         server, server.medmd, noise_range,
         source_loader=server.private_train_loader,   # 服务器用私有训练数据作为源图像
     )
-    # 合并服务器的公开+私有数据+合成数据作为 NeuroFM 训练集
     server_local_loader = server.add_synthetic_data_to_loader(server_syn_local, merge_with="all")
 
-    # 服务器 NeuroFM 训练器（全参数微调，服务器资源充足）
-    s_nfm_trainer = NeuroFMTrainer(
-        server.neurofm,                            # 服务器的 NeuroFM 实例
-        device=device,                             # 计算设备
-        lr=cfg.training.lr_neurofm,               # 本地训练学习率
-        mixed_precision=cfg.training.mixed_precision,  # 是否混合精度
-        use_qlora=False,                           # 服务器全参数训练（非 QLoRA）
+    # 服务器 SwinMultiTask 训练器（全参数微调）
+    s_nfm_trainer = SwinTrainer(
+        server.swin,
+        device=device,
+        lr=cfg.training.lr_swin,
+        mixed_precision=cfg.training.mixed_precision,
+        use_qlora=False,
     )
     for ep in range(cfg.federated.local_rounds):
-        loss = s_nfm_trainer.train_epoch(server_local_loader)   # 训练 1 epoch
-        local_losses["server"].append({"round": ep, "loss": loss})   # 记录损失
+        loss = s_nfm_trainer.train_epoch(server_local_loader)
+        local_losses["server"].append({"round": ep, "loss": loss})
 
-    # ---- 各客户端本地训练：合成样本与私有数据混合，QLoRA 微调 NeuroFM ----
+    # ---- 各客户端本地训练：合成样本与私有数据混合，QLoRA 微调 SwinMultiTask ----
     for c in clients:
-        c_syn_local = _synth_local(c, c.medmd, noise_range)   # 生成合成样本
-        c_local_loader = c.add_synthetic_data_to_loader(c_syn_local)   # 合并私有+合成数据
-        c_nfm_trainer = NeuroFMTrainer(
-            c.neurofm,                             # 客户端的 NeuroFM 实例
-            device=device,                         # 计算设备
-            lr=cfg.training.lr_neurofm,            # 本地训练学习率
+        c_syn_local = _synth_local(c, c.medmd, noise_range)
+        c_local_loader = c.add_synthetic_data_to_loader(c_syn_local)
+        c_nfm_trainer = SwinTrainer(
+            c.swin,
+            device=device,
+            lr=cfg.training.lr_swin,
             mixed_precision=cfg.training.mixed_precision,
-            use_qlora=True,                        # [M4Fed 专有] 客户端使用 QLoRA 微调 NeuroFM
-            qlora_r=cfg.federated.qlora_r,         # LoRA 秩
-            qlora_alpha=cfg.federated.qlora_alpha,  # LoRA 缩放系数
+            use_qlora=True,                        # [M4Fed 专有] 客户端使用 QLoRA 微调
+            qlora_r=cfg.federated.qlora_r,
+            qlora_alpha=cfg.federated.qlora_alpha,
         )
         for ep in range(cfg.federated.local_rounds):
-            loss = c_nfm_trainer.train_epoch(c_local_loader)   # QLoRA 微调 1 epoch
+            loss = c_nfm_trainer.train_epoch(c_local_loader)
             local_losses[f"client_{c.client_id}"].append({"round": ep, "loss": loss})
 
     record_timing(f"{method}/train", time.perf_counter() - _train_t0)   # 记录训练总耗时
@@ -269,33 +267,20 @@ def run_m4fed(
     _eval_t0 = time.perf_counter()   # 记录评估开始时间
     results = {}   # 存储所有节点的评估指标
 
-    def _eval_node(node_id, neurofm, test_loader):
-        """
-        评估单个节点的脑年龄预测性能（推理模式，不更新参数）。
-
-        参数：
-          node_id    : 节点标识符（日志用）
-          neurofm    : 该节点的 NeuroFM 实例
-          test_loader: 测试集 DataLoader
-
-        返回：
-          评估指标字典 {'MAE': ..., 'RMSE': ..., 'Pearson_r': ..., 'R2': ...}
-        """
-        from training.neurofm_trainer import NeuroFMTrainer as T   # 局部导入避免循环依赖
-        trainer = T(neurofm, device=device, lr=0, mixed_precision=False)   # lr=0：纯推理
-        y_true, y_pred = trainer.evaluate(test_loader)   # 推理返回真值和预测值
+    def _eval_node(node_id, swin_model, test_loader):
+        """评估单个节点的脑年龄预测性能（推理模式，不更新参数）。"""
+        from training.swin_trainer import SwinTrainer as T
+        trainer = T(swin_model, device=device, lr=0, mixed_precision=False)
+        y_true, y_pred = trainer.evaluate(test_loader)
         if len(y_true) == 0:
-            # 测试集为空（边缘情况），返回 NaN 指标（不影响整体报告）
             return {"MAE": float("nan"), "RMSE": float("nan"),
                     "Pearson_r": float("nan"), "R2": float("nan")}
-        return compute_domain_metrics(y_true, y_pred)   # 计算 MAE、RMSE、Pearson_r、R²
+        return compute_domain_metrics(y_true, y_pred)
 
-    # 评估服务器节点（使用合并的测试数据）
-    results["server"] = _eval_node("server", server.neurofm, server.test_loader)
-    # 评估各客户端节点（使用各自的私有测试数据）
+    results["server"] = _eval_node("server", server.swin, server.test_loader)
     for c in clients:
         results[f"client_{c.client_id}"] = _eval_node(
-            f"client_{c.client_id}", c.neurofm, c.test_loader
+            f"client_{c.client_id}", c.swin, c.test_loader
         )
     record_timing(f"{method}/eval", time.perf_counter() - _eval_t0)   # 记录评估耗时
 
@@ -325,10 +310,10 @@ def run_m4fed(
 
     # 保存模型权重（若配置要求）
     if cfg.eval.save_model:
-        save_model(server.neurofm, os.path.join(out, "server_neurofm.pt"))   # 服务器 NeuroFM
-        save_model(server.medmd, os.path.join(out, "server_medmd.pt"))       # 服务器 MedMD（热身后）
+        save_model(server.swin, os.path.join(out, "server_swin.pt"))
+        save_model(server.medmd, os.path.join(out, "server_medmd.pt"))
         for c in clients:
-            save_model(c.neurofm, os.path.join(out, f"client_{c.client_id}_neurofm.pt"))
+            save_model(c.swin, os.path.join(out, f"client_{c.client_id}_swin.pt"))
 
     return results   # 返回完整结果字典
 

@@ -1,5 +1,5 @@
 """
-NeuroFM 多任务训练循环。
+SwinUNETR 多任务训练循环（领域模型：脑年龄预测 + 辅助分类任务）。
 
 损失函数：L_MT = Σ_k λ_k · L_k
   - L_k（回归）   = MSE（年龄等连续变量）
@@ -21,14 +21,14 @@ from typing import Dict, List, Optional, Tuple    # 类型注解工具
 
 import numpy as np   # NumPy：NaN 过滤、数组操作（evaluate 返回 numpy 数组）
 
-from models.neurofm.neurofm_multitask import NeuroFMMultiTask   # NeuroFM 多任务模型
+from models.swin.swin_multitask import SwinMultiTask   # SwinUNETR 多任务模型
 from utils.qlora_utils import apply_qlora, get_qlora_params      # QLoRA 工具函数
 from utils.io_utils import save_model                            # 模型保存工具
 
 
-class NeuroFMTrainer:
+class SwinTrainer:
     """
-    封装 NeuroFMMultiTask 的训练和评估逻辑。
+    封装 SwinMultiTask 的训练和评估逻辑。
 
     关键设计：
       - 优化骨干网络 + 所有任务头（或仅 LoRA 参数 + 任务头）
@@ -38,9 +38,9 @@ class NeuroFMTrainer:
 
     def __init__(
         self,
-        model: NeuroFMMultiTask,         # 待训练的 NeuroFM 多任务模型
+        model: SwinMultiTask,            # 待训练的 SwinUNETR 多任务模型
         device: str = "cpu",             # 计算设备（"cuda" 或 "cpu"）
-        lr: float = 5e-5,                # AdamW 初始学习率（NeuroFM 微调通常用小学习率）
+        lr: float = 5e-5,                # AdamW 初始学习率（SwinUNETR 微调通常用小学习率）
         weight_decay: float = 1e-5,      # 权重衰减系数（L2 正则化）
         grad_clip: float = 1.0,          # 梯度裁剪阈值（防止梯度爆炸）
         mixed_precision: bool = True,    # 是否启用 FP16 混合精度（仅 CUDA 有效）
@@ -52,13 +52,13 @@ class NeuroFMTrainer:
         global_state: Optional[dict] = None,  # FedProx 需要的全局模型权重（近端项锚点）
     ):
         """
-        初始化 NeuroFM 训练器，配置优化器、QLoRA 和 FedProx 近端项。
+        初始化训练器，配置优化器、QLoRA 和 FedProx 近端项。
 
         参数：
           proximal_mu  : FedProx 近端正则化系数 μ（>0 时启用 FedProx）
           global_state : FedProx 中的全局模型状态字典（与 proximal_mu 配合使用，0 时忽略）
         """
-        self.model = model                   # 保存 NeuroFM 模型引用
+        self.model = model                   # 保存 SwinMultiTask 模型引用
         self.device = device                 # 保存计算设备字符串
         self.grad_clip = grad_clip           # 保存梯度裁剪阈值
         self.proximal_mu = proximal_mu       # 保存近端系数（0 = 禁用近端项）
@@ -71,7 +71,7 @@ class NeuroFMTrainer:
         if use_qlora:
             # QLoRA 模式：仅对骨干网络的线性层添加 LoRA 适配器（任务头始终全量训练）
             self.model.backbone = apply_qlora(
-                self.model.backbone,             # 目标模块（NeuroFM 骨干）
+                self.model.backbone,             # 目标模块（SwinUNETR 骨干）
                 r=qlora_r,                       # LoRA 秩（秩越小参数越少，节省通信）
                 lora_alpha=qlora_alpha,          # LoRA 缩放系数
                 lora_dropout=qlora_dropout,      # LoRA Dropout
@@ -95,6 +95,7 @@ class NeuroFMTrainer:
         """
         从批次数据中构建各任务的目标张量（标签）。
 
+        批次字典里同时保存了 age 和 metadata 两个键（还有 mri、text）
         来源优先级：
           1. batch["metadata"]（dict 或 pd.Series 列表）中对应字段名的值
           2. 若 metadata 不含该字段但 batch 含 "age" 键（向后兼容），直接使用
@@ -129,9 +130,10 @@ class NeuroFMTrainer:
                         vals.append(float("nan"))   # 无法转换时设为 NaN（如 "unknown"）
                 # 将 float 列表转为 float32 张量并移到计算设备
                 targets[field] = torch.tensor(vals, dtype=torch.float32, device=self.device)
-            elif field == "age" and "age" in batch:
-                # metadata 不可用时的向后兼容路径：直接从 batch["age"] 获取年龄
-                targets["age"] = batch["age"].to(self.device)
+            elif field in batch:
+                # metadata 不可用时的向后兼容路径：直接从 batch 中取预堆叠张量
+                # 适用于 age、health_status、race 等已在 _collate_fn 中堆叠好的字段
+                targets[field] = batch[field].to(self.device)
         return targets   # 返回各任务的目标张量字典
 
     def train_epoch(self, loader: DataLoader) -> float:
@@ -215,7 +217,7 @@ class NeuroFMTrainer:
 
         参数：
           loader    : 训练数据 DataLoader
-          n_epochs  : 训练 epoch 数
+          n_epochs  : 本地训练 epoch 数
           save_path : 若不为 None，训练结束后将模型保存到该路径
 
         返回：

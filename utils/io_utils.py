@@ -33,7 +33,7 @@ def save_csv(data: Any, path: str) -> None:
       data : 要保存的数据
       path : CSV 文件路径
     """
-    ensure_dir(os.path.dirname(path) or ".")  # 确保父目录存在（path 若无目录部分则用当前目录）
+    ensure_dir(os.path.dirname(path) or ".")  # 确保父目录存在（path 若无目录部分则用当前目录-工作目录-启动python脚本的目录）
     if isinstance(data, pd.DataFrame):
         data.to_csv(path, index=False)         # DataFrame 直接保存，不写行索引
     else:

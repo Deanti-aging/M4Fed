@@ -55,6 +55,7 @@ class DDIMScheduler:
         """
         self.T = T   # 保存扩散总步数，供外部访问（如计算 t_start）
         # 在 √β 空间线性插值后取平方：此调度比直接线性 β 更平缓，数值更稳定
+        # 效果是让噪声调度在初期更"温和"，避免早期扩散步骤中信号衰减过快，数值上也更稳定（不会出现 β 突变导致的训练不稳定）。这是 improved DDPM (2021) 中提出的调度技巧之一
         betas = torch.linspace(beta_start ** 0.5, beta_end ** 0.5, T) ** 2
         # α_t = 1 - β_t：每步保留的信号比例
         alphas = 1.0 - betas

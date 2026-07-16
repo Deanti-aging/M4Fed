@@ -4,10 +4,10 @@ import copy                           # 标准库：深拷贝（备用，供子�
 from typing import Dict, List, Optional   # 类型注解工具
 from torch.utils.data import ConcatDataset   # PyTorch 数据集拼接工具
 
-from .base_participant import BaseParticipant              # 参与者基类（含模型接口）
-from models.medmd.medmd import MedMD                       # MedMD 生成模型
-from models.neurofm.neurofm_multitask import NeuroFMMultiTask   # NeuroFM 多任务预测模型
-from data.openmind_dataset import OpenMindDataset, make_dataloader   # 数据集和 DataLoader 工厂
+from .base_participant import BaseParticipant                       # 参与者基类（含模型接口）
+from models.medmd.medmd import MedMD                                # MedMD 生成模型
+from models.swin.swin_multitask import SwinMultiTask                 # SwinUNETR 多任务预测模型
+from data.openmind_dataset import OpenMindDataset, make_dataloader  # 数据集和 DataLoader 工厂
 
 
 class Server(BaseParticipant):
@@ -20,12 +20,12 @@ class Server(BaseParticipant):
       - 另有独立的 public_train_loader 和 private_train_loader（分阶段训练用）
       - 热身阶段：服务器在公开数据上预训练 MedMD，然后将 U-Net 分发给所有客户端
       - 联邦循环：服务器接收各客户端的合成数据，用于更新 MedMD
-      - 本地训练：服务器在自身私有数据上训练 NeuroFM
+      - 本地训练：服务器在自身私有数据上训练 SwinMultiTask
 
     数据访问策略（论文设计）：
       - MedMD 热身：只用公开数据（public_train_loader）
-      - NeuroFM 本地训练：私有数据 + 合成数据（add_synthetic_data_to_loader）
-      - 评估：公开数据 + 私有数据（test_loader）
+      - 领域模型本地训练：私有数据 + 合成数据（add_synthetic_data_to_loader）
+      - 评估：只用私有数据（test_loader；公开数据全量用于训练，不保留测试集）
     """
 
     node_id = "server"   # 服务器的固定节点标识符（客户端为 "client_{id}"）
@@ -36,25 +36,21 @@ class Server(BaseParticipant):
         参数：
           cfg              : 全局配置对象（M4FedConfig）
           private_datasets : 服务器私有数据集 {'train': Dataset, 'test': Dataset}
-          public_datasets  : 服务器公开数据集 {'train': Dataset, 'test': Dataset}
+          public_datasets  : 服务器公开数据集 {'train': Dataset}（全量训练，无测试集）
           device           : 计算设备（"cuda" 或 "cpu"）
         """
         super().__init__(cfg, device)            # 调用基类初始化（设置 cfg、device 等公共属性）
         self.private_datasets = private_datasets  # 保存私有数据集（联邦协议中的私有部分）
         self.public_datasets = public_datasets    # 保存公开数据集（MedMD 热身训练使用）
 
-        # ---- 混合 DataLoader（公开 + 私有，用于全量评估和全量训练） ----
+        # ---- 混合 DataLoader（公开 + 私有训练，用于全量训练） ----
         # 将公开训练集和私有训练集合并（服务器特有权限，可访问两类数据）
+        # 公开数据全量作为训练集，不保留测试集（see build_node_datasets）
         combined_train = ConcatDataset([
-            public_datasets["train"],   # 公开训练数据集
+            public_datasets["train"],   # 公开训练数据集（全量）
             private_datasets["train"],  # 服务器私有训练数据集
         ])
-        # 将公开测试集和私有测试集合并（评估服务器的全部数据）
-        combined_test = ConcatDataset([
-            public_datasets["test"],    # 公开测试数据集
-            private_datasets["test"],   # 服务器私有测试数据集
-        ])
-        # 全量混合训练 DataLoader（用于评估和全局训练）
+        # 全量混合训练 DataLoader（公开 + 私有训练集，用于全量训练）
         self.train_loader = make_dataloader(
             combined_train,                         # 合并的训练数据集
             cfg.training.batch_size,                # 批大小
@@ -62,9 +58,9 @@ class Server(BaseParticipant):
             num_workers=cfg.training.num_workers,   # 并行 worker 数
             seed=cfg.training.seed,                 # 随机种子（保证可复现）
         )
-        # 全量混合测试 DataLoader（不打乱，保证评估结果可比较）
+        # 测试 DataLoader：只用私有测试集（公开数据无测试集，评估口径与其他节点一致）
         self.test_loader = make_dataloader(
-            combined_test,                          # 合并的测试数据集
+            private_datasets["test"],               # 只使用私有测试数据集
             cfg.training.batch_size,                # 批大小
             shuffle=False,                          # 测试集不打乱
             num_workers=cfg.training.num_workers,   # 并行 worker 数
@@ -80,7 +76,7 @@ class Server(BaseParticipant):
             num_workers=cfg.training.num_workers,   # 并行 worker 数
             seed=cfg.training.seed,                 # 随机种子
         )
-        # 本地训练阶段 NeuroFM 只在私有数据上训练（严格保护私有数据不外泄）
+        # 本地训练阶段领域模型只在私有数据上训练（严格保护私有数据不外泄）
         self.private_train_loader = make_dataloader(
             private_datasets["train"],              # 只使用私有训练数据
             cfg.training.batch_size,                # 批大小
@@ -91,35 +87,28 @@ class Server(BaseParticipant):
 
     def build_models(
         self,
-        task_specs: dict,                    # 预测任务规格字典（任务名 → 类别数/连续）
-        random_init_neurofm: bool = False,   # 是否随机初始化 NeuroFM 骨干（消融实验用）
+        task_specs: dict,                 # 预测任务规格字典（任务名 → 类别数/连续）
+        random_init_swin: bool = False,   # 是否随机初始化 SwinUNETR 骨干（消融实验用）
     ) -> None:
         """
-        构建服务器的 MedMD 和 NeuroFM 模型实例。
+        构建服务器的 MedMD 和 SwinMultiTask 模型实例。
 
-        与客户端构建逻辑基本一致，但 MedMD 的 VAE 校准使用公开数据
-        （而非私有数据），因为热身训练本身在公开数据上进行。
-
-        参数：
-          task_specs           : 预测任务规格字典（见 NeuroFMMultiTask 说明）
-          random_init_neurofm  : 是否随机初始化 NeuroFM 骨干（消融实验 C 用）
+        与客户端构建逻辑基本一致，但 MedMD 的 VAE 校准使用公开数据。
         """
-        # 构建 MedMD 生成模型并移动到指定设备
         self.medmd = MedMD(self.cfg.model, device=self.device).to(self.device)
         if self.cfg.model.calibrate_vae_scale:
-            # 服务器 MedMD 用公开数据进行热身，VAE 校准也使用公开数据
-            # （公开数据分布更广，统计的 std 更具代表性）
             self.medmd.calibrate_scale_factor(
-                self.public_train_loader,                       # 公开训练数据 DataLoader
-                n_batches=self.cfg.model.vae_calibration_batches,  # 校准批次数
+                self.public_train_loader,
+                n_batches=self.cfg.model.vae_calibration_batches,
             )
-        # 构建 NeuroFM 多任务预测模型并移动到指定设备
-        self.neurofm = NeuroFMMultiTask(
-            repo_id=self.cfg.model.neurofm_repo,           # 预训练骨干的 HuggingFace 仓库 ID
-            task_specs=task_specs,                          # 任务规格字典
-            device=self.device,                             # 计算设备
-            random_init=random_init_neurofm,                # 是否随机初始化骨干（消融用）
-            age_loss_weight=self.cfg.training.age_loss_weight,  # 年龄回归损失权重
+        self.swin = SwinMultiTask(
+            pretrain_url=self.cfg.model.swinunetr_pretrain_url,
+            img_size=tuple(self.cfg.data.mri_shape),
+            feature_size=self.cfg.model.swinunetr_feature_size,
+            task_specs=task_specs,
+            device=self.device,
+            random_init=random_init_swin,
+            age_loss_weight=self.cfg.training.age_loss_weight,
         ).to(self.device)
 
     def n_private_train(self) -> int:

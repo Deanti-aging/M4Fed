@@ -145,50 +145,6 @@ class _LRUDiskCache:
                 pass   # 文件可能已被其他进程删除，忽略错误
 
 
-# =========================================================================== #
-#  辅助函数：子数据集质量评分                                                      #
-# =========================================================================== #
-
-def _has_mostly_non_null(df: pd.DataFrame, field: str, threshold: float = 0.5) -> bool:
-    """
-    判断 DataFrame 中某字段的非空值比例是否超过阈值。
-
-    用途：筛选年龄、性别等关键字段覆盖率足够高的子数据集（避免大量 NaN 影响训练）。
-
-    参数：
-      df        : 子数据集对应的 metadata DataFrame
-      field     : 待检查的字段名（如 "age"）
-      threshold : 非空值比例阈值（默认 0.5，即至少 50% 的样本有该字段值）
-
-    返回：
-      True 表示覆盖率足够高（可用于训练），False 表示该字段缺失值过多
-    """
-    if field not in df.columns:
-        return False                     # 字段不存在时直接返回 False
-    non_null = df[field].notna().mean()  # 计算非空值比例（notna() 返回布尔序列）
-    return non_null >= threshold         # 与阈值比较
-
-
-def _score_ds(df: pd.DataFrame, required_fields: List[str]) -> float:
-    """
-    计算子数据集的质量分数：所有必要字段的非空值比例的均值。
-
-    分数范围：[0.0, 1.0]，越高说明标注越完整（1.0 = 所有字段均无缺失值）。
-    用途：在分配数据集角色时优先选择标注完整的子数据集。
-
-    参数：
-      df              : 子数据集对应的 metadata DataFrame
-      required_fields : 必须有足够覆盖率的字段列表（如 ["age", "sex"]）
-
-    返回：
-      质量分数 float（空 DataFrame 或 None 时返回 0.0）
-    """
-    if df is None or df.empty:
-        return 0.0   # 空数据集质量分数为 0
-    # 对每个必要字段计算非空值比例，字段不存在时记为 0
-    return np.mean([df[f].notna().mean() if f in df.columns else 0.0
-                    for f in required_fields])
-
 
 # =========================================================================== #
 #  核心数据集类                                                                   #
@@ -264,11 +220,22 @@ class OpenMindDataset(Dataset):
         age_tensor = (torch.tensor(float(age), dtype=torch.float32)
                       if age is not None else torch.tensor(float("nan")))
 
+        # 步骤 5：构造类别型标签张量（health_status、race 等预编码整数字段）
+        def _cat_tensor(key: str) -> torch.Tensor:
+            """将样本字典中的预编码整数（或 None/NaN）转为 float32 张量（缺失时为 NaN）。"""
+            v = s.get(key)
+            try:
+                return torch.tensor(float(v), dtype=torch.float32)
+            except (TypeError, ValueError):
+                return torch.tensor(float("nan"))
+
         return {
-            "mri": mri_tensor,                             # (1, D, H, W) float32 张量
-            "text": s.get("table_text", "brain MRI scan"),  # 文本条件（无时用默认值）
-            "age": age_tensor,                             # 0 维 float32 张量（可能为 nan）
-            "metadata": s.get("metadata", {}),            # 元数据（pd.Series 或空 dict）
+            "mri": mri_tensor,                              # (1, D, H, W) float32 张量
+            "text": s.get("table_text", "brain MRI scan"),   # 文本条件（无时用默认值）
+            "age": age_tensor,                              # 0 维 float32 张量（可能为 nan）
+            "health_status": _cat_tensor("health_status"),  # 预编码整数标签（可能为 nan）
+            "race": _cat_tensor("race"),                    # 预编码整数标签（可能为 nan）
+            "metadata": s.get("metadata", {}),             # 元数据（pd.Series 或空 dict）
         }
 
     # ---------------------------------------------------------------------- #
@@ -295,7 +262,8 @@ class OpenMindDataset(Dataset):
 
         # 优先级 2 & 3：尝试从本地磁盘或 HuggingFace 获取文件路径
         mri_path = s.get("mri_path")           # 本地磁盘路径（可能为 None）
-        if not mri_path and s.get("hf_image_path"):
+        # 若本地文件不存在（首次访问或 LRU 淘汰后），重新从 HuggingFace 下载
+        if s.get("hf_image_path") and not (mri_path and os.path.exists(mri_path)):
             mri_path = self._resolve_hf_path(s)   # 惰性下载 HuggingFace 文件
 
         if mri_path and os.path.exists(mri_path):
@@ -457,6 +425,9 @@ def list_ds_ids_from_metadata(
 # 用于生成文本条件与年龄标签（不包含扫描技术字段，避免泄露设备信息）
 _PATIENT_FIELDS = ["age", "weight", "bmi", "sex", "handedness", "race", "health_status"]
 
+# 需要作为分类任务头预测的类别型字段（编码为整数后存入样本字典，与 age 类似流程）
+_CATEGORICAL_PRED_FIELDS = ["health_status", "race"]
+
 
 def _load_openmind_metadata(repo_id: str, cache_dir: Optional[str], modality: Optional[str]) -> pd.DataFrame:
     """
@@ -536,6 +507,14 @@ def make_openmind_sample_loader(
     # 按 ds_id 分组，建立 {ds_id: DataFrame} 字典（O(1) 查询每个子数据集的行）
     grouped = {ds_id: g for ds_id, g in df.groupby("ds_id")}
 
+    # 对 _CATEGORICAL_PRED_FIELDS 中的类别型字段拟合标签编码映射
+    # 在全量 df 上统计所有可能取值，保证编码跨子数据集一致
+    label_maps: dict = {}   # {字段名: {字符串值: 整数索引}}
+    for field in _CATEGORICAL_PRED_FIELDS:
+        if field in df.columns:
+            unique_vals = sorted(df[field].dropna().astype(str).unique().tolist())
+            label_maps[field] = {v: i for i, v in enumerate(unique_vals)}
+
     # 确定 NIfTI 文件的本地存放目录
     mri_local_dir = (os.path.join(cache_dir, "mri_files")  # 指定 cache_dir 时的子目录
                      if cache_dir else _DEFAULT_MRI_LOCAL_DIR)  # 未指定时用默认目录
@@ -565,7 +544,7 @@ def make_openmind_sample_loader(
             # 脑龄预测任务要求年龄标签：跳过年龄为空的受试者，不触发 NIfTI 文件下载
             if pd.isna(age):
                 continue
-            samples.append({
+            sample = {
                 "hf_repo_id": repo_id,                         # HuggingFace 仓库 ID
                 "hf_image_path": row["image_path"],             # NIfTI 文件仓库内相对路径
                 "hf_local_dir": mri_local_dir,                 # 本地 NIfTI 文件缓存目录
@@ -574,49 +553,24 @@ def make_openmind_sample_loader(
                 "table_text": table_row_to_text(row.reindex(_PATIENT_FIELDS)),
                 "age": float(age),   # 已确认非 NaN，直接转 float
                 "metadata": row,                                # 完整行（含扫描设备信息，供偏差分析）
-            })
+            }
+            # 编码类别型预测字段（health_status、race 等）为整数索引
+            # 未知或缺失值编码为 NaN，compute_loss 中的 NaN mask 会自动忽略
+            for field in _CATEGORICAL_PRED_FIELDS:
+                raw = row.get(field)
+                if raw is not None and not pd.isna(raw):
+                    lmap = label_maps.get(field, {})
+                    idx = lmap.get(str(raw))
+                    sample[field] = float(idx) if idx is not None else float("nan")
+                else:
+                    sample[field] = float("nan")
+            samples.append(sample)
         return samples   # 返回该子数据集中年龄非空的所有样本字典
 
+    # 将标签编码映射作为属性挂载到闭包函数上，供调用方构建 task_specs
+    _sample_loader_fn.label_maps = label_maps
+    _sample_loader_fn.n_classes = {f: len(m) for f, m in label_maps.items()}
     return _sample_loader_fn   # 返回闭包函数（作为 build_node_datasets 的 sample_loader_fn 参数）
-
-
-# =========================================================================== #
-#  虚拟样本生成器（单元测试和快速冒烟测试使用）                                        #
-# =========================================================================== #
-
-def _make_dummy_samples(n: int, mri_shape=(16, 16, 16), seed=0) -> List[dict]:
-    """
-    生成 n 个微型虚拟样本，用于单元测试和快速冒烟测试，无需任何真实数据。
-
-    生成规则：
-      - MRI 体积：标准正态随机噪声（shape=mri_shape, dtype=float32）
-      - 年龄：20-80 之间的随机整数（均匀分布）
-      - 性别：奇数索引为 female，偶数为 male（交替赋值保证性别平衡）
-      - 健康状态：固定为 "healthy"（简化验证逻辑）
-
-    参数：
-      n         : 要生成的样本数量
-      mri_shape : 随机 MRI 体积的形状（虚拟模式通常用 (16, 16, 16)）
-      seed      : 随机种子（确保每次生成相同的虚拟数据集）
-
-    返回：
-      包含 n 个样本字典的列表
-    """
-    rng = np.random.RandomState(seed)   # 创建独立随机状态（不影响全局种子）
-    samples = []
-    for i in range(n):
-        age = float(rng.randint(20, 80))   # 生成 20-80 之间的随机整数年龄
-        samples.append({
-            "mri_array": rng.randn(*mri_shape).astype(np.float32),   # 随机 MRI 噪声体积
-            "table_text": f"age is {int(age)}, sex is {'male' if i % 2 == 0 else 'female'}",  # 简单文本描述
-            "age": age,   # 年龄标签
-            "metadata": pd.Series({
-                "age": age,                                        # 年龄（用于偏差分析）
-                "sex": "male" if i % 2 == 0 else "female",        # 性别（交替）
-                "health_status": "healthy",                        # 健康状态（固定值）
-            }),
-        })
-    return samples   # 返回虚拟样本列表
 
 
 # =========================================================================== #
@@ -631,10 +585,7 @@ def build_node_datasets(
     train_split: float,               # 训练集比例（剩余为测试集）
     mri_shape: Tuple[int, int, int],  # MRI 体积目标尺寸（D, H, W）
     seed: int,                        # 随机种子（数据划分 + DataLoader shuffle）
-    sample_loader_fn=None,            # 可调用对象：ds_id → List[dict]（非 dummy 模式必须提供）
-    dummy_mode: bool = False,         # 是否使用虚拟随机噪声数据（跳过真实数据加载）
-    n_dummy_per_ds: int = 4,          # dummy 模式下每个子数据集生成的虚拟样本数
-    n_public_max: Optional[int] = None,  # "public" 角色最多分配的子数据集数量
+    sample_loader_fn=None,            # 可调用对象：ds_id → List[dict]（必须提供）
 ) -> Dict[str, Dict[str, "OpenMindDataset"]]:
     """
     根据数据集 ID 分配方案，构建各联邦节点的训练/测试数据集。
@@ -642,7 +593,7 @@ def build_node_datasets(
     返回值结构（嵌套字典）：
       {
         'server_private': {'train': OpenMindDataset, 'test': OpenMindDataset},
-        'server_public':  {'train': OpenMindDataset, 'test': OpenMindDataset},
+        'server_public':  {'train': OpenMindDataset},                            # 全量训练，无测试集
         'client_0':       {'train': OpenMindDataset, 'test': OpenMindDataset},
         'client_1':       {'train': OpenMindDataset, 'test': OpenMindDataset},
         ...
@@ -654,13 +605,10 @@ def build_node_datasets(
       n_cross           : 分配给跨站点评估的子数据集数量（不参与训练）
       n_private_per_node: 每个节点分配的私有子数据集数量（服务器私有 + 每客户端私有）
       n_clients         : 联邦学习客户端数量
-      train_split       : 训练集比例（如 0.9 表示 90% 训练、10% 测试）
+      train_split       : 训练集比例（如 0.9 表示 90% 训练、10% 测试；仅用于私有和客户端数据集，公开数据全量训练）
       mri_shape         : MRI 体积预处理目标尺寸（如 (96, 96, 96)）
       seed              : 随机种子（保证数据划分可复现）
-      sample_loader_fn  : 真实数据加载函数（dummy_mode=False 时必须提供）
-      dummy_mode        : True 时使用随机噪声替代真实 NIfTI 文件（快速测试）
-      n_dummy_per_ds    : dummy_mode 下每个子数据集生成的虚拟样本数
-      n_public_max      : "public" 角色最多分配的子数据集数量（防止全量下载导致磁盘满）
+      sample_loader_fn  : 真实数据加载函数（必须提供）
     """
     _build_t0 = time.perf_counter()   # 记录构建开始时间（用于耗时统计）
 
@@ -668,15 +616,13 @@ def build_node_datasets(
     # assign_ds_splits 返回 {role: [ds_id, ...]} 字典
     split_ids = assign_ds_splits(
         all_ds_ids, n_cross, n_private_per_node, n_clients, seed,
-        n_public_max=n_public_max,   # 公开数据集上限（避免磁盘溢出）
     )
 
     def _load_ds(ids: List[str]) -> List[dict]:
         """
         内部辅助函数：为指定 ID 列表加载样本。
 
-        dummy_mode=True 时生成确定性随机噪声样本（基于 ID 列表的哈希值作为种子）；
-        否则对每个 ds_id 调用 sample_loader_fn 加载真实数据。
+        对每个 ds_id 调用 sample_loader_fn 加载真实数据。
 
         参数：
           ids : 子数据集 ID 字符串列表
@@ -684,13 +630,8 @@ def build_node_datasets(
         返回：
           合并后的样本字典列表
         """
-        if dummy_mode:
-            # 从 ID 列表派生确定性种子（相同 ID 集合总是生成相同的虚拟样本）
-            rng_seed = abs(hash(tuple(ids))) % (2**31)   # hash 值取绝对值后取模
-            return _make_dummy_samples(len(ids) * n_dummy_per_ds,   # 总样本数 = ID数 × 每DS样本数
-                                       mri_shape=mri_shape, seed=rng_seed)
         if sample_loader_fn is None:
-            raise ValueError("非 dummy 模式必须提供 sample_loader_fn 参数")
+            raise ValueError("必须提供 sample_loader_fn 参数")
         samples = []
         for ds_id in ids:
             samples.extend(sample_loader_fn(ds_id))   # 逐 ID 加载并合并样本
@@ -698,7 +639,7 @@ def build_node_datasets(
 
     result: Dict[str, Dict[str, OpenMindDataset]] = {}   # 初始化结果字典
 
-    # ---------- 服务器私有数据集（用于服务器端 NeuroFM 本地训练和评估） ----------
+    # ---------- 服务器私有数据集（用于服务器端 SwinMultiTask 本地训练和评估） ----------
     s_priv = _load_ds(split_ids["server_private"])           # 加载服务器私有样本
     tr_idx, te_idx = train_test_split_indices(len(s_priv), train_split, seed)  # 划分训练/测试
     result["server_private"] = {
@@ -707,11 +648,12 @@ def build_node_datasets(
     }
 
     # ---------- 服务器公开数据集（用于 MedMD 热身预训练 + VAE 校准） ----------
+    # 公开数据全量作为训练集，不划分测试集：
+    # 公开数据的唯一用途是扩充 MedMD 热身训练的样本多样性，不参与服务器评估流程
+    # （评估仅使用私有测试集，以保证评估口径与其他节点一致）
     s_pub = _load_ds(split_ids["public"])                    # 加载公开数据集样本
-    tr_idx, te_idx = train_test_split_indices(len(s_pub), train_split, seed)
     result["server_public"] = {
-        "train": OpenMindDataset([s_pub[i] for i in tr_idx], mri_shape),   # 训练集
-        "test":  OpenMindDataset([s_pub[i] for i in te_idx], mri_shape),   # 测试集
+        "train": OpenMindDataset(s_pub, mri_shape),          # 全量训练集（不保留测试集）
     }
 
     # ---------- 各客户端私有数据集（每个客户端拥有自己的私有数据，不与其他节点共享） ----------
@@ -769,7 +711,7 @@ def make_dataloader(
         batch_size=batch_size,               # 批大小
         shuffle=shuffle,                      # 是否打乱
         num_workers=num_workers,              # 工作线程数
-        pin_memory=False,                     # 不固定内存（避免 CUDA 设备内存压力）
+        pin_memory=True,                      # 锁页内存，加速 CPU→GPU 数据传输
         generator=generator,                  # 固定种子的随机数生成器
         collate_fn=_collate_fn,              # 自定义批次合并函数
     )
@@ -791,8 +733,17 @@ def _collate_fn(batch: list) -> dict:
     返回：
       批次字典（keys: 'mri', 'text', 'age', 'metadata'）
     """
-    mris = torch.stack([b["mri"] for b in batch])       # 沿 batch 维度堆叠 MRI 张量
-    ages = torch.stack([b["age"] for b in batch])        # 沿 batch 维度堆叠年龄张量
-    texts = [b["text"] for b in batch]                   # 文本保持为 list（不 pad）
-    metadata = [b["metadata"] for b in batch]            # 元数据保持为 list
-    return {"mri": mris, "text": texts, "age": ages, "metadata": metadata}
+    mris = torch.stack([b["mri"] for b in batch])                    # 沿 batch 维度堆叠 MRI 张量
+    ages = torch.stack([b["age"] for b in batch])                     # 沿 batch 维度堆叠年龄张量
+    health_statuses = torch.stack([b["health_status"] for b in batch])  # 健康状态整数标签（可含 NaN）
+    races = torch.stack([b["race"] for b in batch])                   # 种族整数标签（可含 NaN）
+    texts = [b["text"] for b in batch]                                # 文本保持为 list（不 pad）
+    metadata = [b["metadata"] for b in batch]                         # 元数据保持为 list
+    return {
+        "mri": mris,
+        "text": texts,
+        "age": ages,
+        "health_status": health_statuses,
+        "race": races,
+        "metadata": metadata,
+    }

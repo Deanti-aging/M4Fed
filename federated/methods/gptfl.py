@@ -4,7 +4,7 @@ GPT-FL 基线（He et al., 10.1109/CVPRW67362.2025.00164）。
 训练配置：
   - 1 个 server + 3 个 clients，每个 client 有 20 个子数据集的 private data
   - 生成模型（generative model）：M4Fed 热身阶段在 server 上预训练好的 MedMD
-  - 领域模型（domain model）：NeuroFM，参数随机初始化
+  - 领域模型（domain model）：SwinMultiTask，参数随机初始化
 
 训练过程：
   热身阶段（Warm-up）：
@@ -12,12 +12,12 @@ GPT-FL 基线（He et al., 10.1109/CVPRW67362.2025.00164）。
     2. server 合并 age 标签值并删除重复项
     3. server 使用 MedMD 仅以 "age is <age_val>" 为 condition（不使用 img）
        推理生成 synthetic 3D MRI，数量等于所有 clients 的 private data 数量之和
-    4. server 用 synthetic data 预训练 NeuroFM（domain model）
-    5. server 将预训练好的 NeuroFM 分发给每个 client
+    4. server 用 synthetic data 预训练 SwinMultiTask（domain model）
+    5. server 将预训练好的 SwinMultiTask 分发给每个 client
 
   联邦循环阶段（Federated Loop）：
     - 训练轮数 = federated_rounds
-    - 训练方式同 FedAvg（服务器广播全局 NeuroFM → 客户端在 private data 上本地训练 → FedAvg 聚合）
+    - 训练方式同 FedAvg（服务器广播全局 SwinMultiTask → 客户端在 private data 上本地训练 → FedAvg 聚合）
 """
 from __future__ import annotations
 import copy, os
@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 from typing import List
 
-from training.neurofm_trainer import NeuroFMTrainer
+from training.swin_trainer import SwinTrainer
 from evaluation.metrics import compute_domain_metrics
 from data.openmind_dataset import OpenMindDataset, make_dataloader
 from utils.io_utils import save_csv, save_model, ensure_dir, load_model
@@ -45,7 +45,7 @@ def run_gptfl(
     运行 GPT-FL 联邦训练协议。
 
     参数：
-      server               : Server 实例（持有 MedMD，热身阶段生成 synthetic data 并预训练 NeuroFM）
+      server               : Server 实例（持有 MedMD，热身阶段生成 synthetic data 并预训练 SwinMultiTask）
       clients              : Client 实例列表
       cfg                  : M4FedConfig 全局配置
       task_specs           : 预测任务规格字典
@@ -65,12 +65,12 @@ def run_gptfl(
     device = cfg.training.device
     out = ensure_dir(os.path.join(results_dir, "gptfl"))
 
-    # 所有客户端随机初始化 NeuroFM（GPT-FL domain model 随机初始化，后由 server 分发预训练权重）
+    # 所有客户端随机初始化 SwinMultiTask（GPT-FL domain model 随机初始化，后由 server 分发预训练权重）
     for c in clients:
-        c.build_models(task_specs, random_init_neurofm=True)
+        c.build_models(task_specs, random_init_swin=True)
 
-    # 服务器：NeuroFM 随机初始化，MedMD 加载 M4Fed 预训练权重（若可用）
-    server.build_models(task_specs, random_init_neurofm=True)
+    # 服务器：SwinMultiTask 随机初始化，MedMD 加载 M4Fed 预训练权重（若可用）
+    server.build_models(task_specs, random_init_swin=True)
     if pretrained_medmd_path and os.path.exists(pretrained_medmd_path):
         load_model(server.medmd, pretrained_medmd_path, strict=False)
         print(f"[GPT-FL] 成功加载预训练 MedMD：{pretrained_medmd_path}")
@@ -117,28 +117,28 @@ def run_gptfl(
         if (idx + 1) % max(1, n_total // 10) == 0:
             print(f"[GPT-FL]   已生成 {idx+1}/{n_total} 个 synthetic 样本")
 
-    # Step 3：server 在 synthetic data 上预训练 NeuroFM（domain model）
+    # Step 3：server 在 synthetic data 上预训练 SwinMultiTask（domain model）
     syn_ds = OpenMindDataset(server_syn, tuple(cfg.data.mri_shape))
     syn_loader = make_dataloader(syn_ds, cfg.training.batch_size,
                                  shuffle=True, seed=cfg.training.seed)
-    server_dom_trainer = NeuroFMTrainer(
-        server.neurofm, device=device,
-        lr=cfg.training.lr_neurofm,
+    server_dom_trainer = SwinTrainer(
+        server.swin, device=device,
+        lr=cfg.training.lr_swin,
         mixed_precision=cfg.training.mixed_precision,
         use_qlora=False,
     )
     warmup_losses = []
-    print(f"[GPT-FL] 在 synthetic data 上预训练 NeuroFM（{cfg.federated.warm_rounds} epochs）")
+    print(f"[GPT-FL] 在 synthetic data 上预训练 SwinMultiTask（{cfg.federated.warm_rounds} epochs）")
     for ep in range(cfg.federated.warm_rounds):
         loss = server_dom_trainer.train_epoch(syn_loader)
         warmup_losses.append({"phase": "warmup", "round": ep, "loss": loss})
         print(f"[GPT-FL]   warmup epoch {ep+1}/{cfg.federated.warm_rounds}，loss={loss:.4f}")
 
-    # Step 4：server 将预训练好的 NeuroFM 分发给每个 client
-    global_state = copy.deepcopy(server.neurofm.state_dict())
+    # Step 4：server 将预训练好的 SwinMultiTask 分发给每个 client
+    global_state = copy.deepcopy(server.swin.state_dict())
     for c in clients:
-        c.neurofm.load_state_dict(copy.deepcopy(global_state))
-    print("[GPT-FL] NeuroFM 预训练权重已分发给所有 clients")
+        c.swin.load_state_dict(copy.deepcopy(global_state))
+    print("[GPT-FL] SwinMultiTask 预训练权重已分发给所有 clients")
 
     # ------------------------------------------------------------------ #
     # 联邦循环阶段（Federated Loop，训练方式同 FedAvg）                        #
@@ -154,13 +154,11 @@ def run_gptfl(
         local_ns = []
 
         for c in clients:
-            # 广播：将全局 NeuroFM 权重分发给客户端
-            c.neurofm.load_state_dict(copy.deepcopy(global_state))
+            c.swin.load_state_dict(copy.deepcopy(global_state))
 
-            # 客户端在本地 private data 上训练 1 epoch（与 FedAvg 一致）
-            trainer = NeuroFMTrainer(
-                c.neurofm, device=device,
-                lr=cfg.training.lr_neurofm,
+            trainer = SwinTrainer(
+                c.swin, device=device,
+                lr=cfg.training.lr_swin,
                 mixed_precision=cfg.training.mixed_precision,
                 use_qlora=False,
             )
@@ -168,7 +166,7 @@ def run_gptfl(
             all_losses[f"client_{c.client_id}"].append(
                 {"phase": "federated", "round": rnd, "loss": losses[0]}
             )
-            local_states.append(copy.deepcopy(c.neurofm.state_dict()))
+            local_states.append(copy.deepcopy(c.swin.state_dict()))
             local_ns.append(c.n_train_samples())
 
         # FedAvg 加权平均聚合
@@ -176,12 +174,12 @@ def run_gptfl(
 
     record_timing("gptfl/train", time.perf_counter() - _train_t0)
 
-    # ---- 评估阶段：将最终全局模型分发给各客户端并在测试集上评估 ----
+    # ---- 评估阶段 ----
     _eval_t0 = time.perf_counter()
     results = {}
     for c in clients:
-        c.neurofm.load_state_dict(copy.deepcopy(global_state))
-        t = NeuroFMTrainer(c.neurofm, device=device, lr=0, mixed_precision=False)
+        c.swin.load_state_dict(copy.deepcopy(global_state))
+        t = SwinTrainer(c.swin, device=device, lr=0, mixed_precision=False)
         y_true, y_pred = t.evaluate(c.test_loader)
         results[f"client_{c.client_id}"] = compute_domain_metrics(y_true, y_pred)
     record_timing("gptfl/eval", time.perf_counter() - _eval_t0)
@@ -202,7 +200,7 @@ def run_gptfl(
         save_csv(pd.DataFrame([results[key]]),
                  os.path.join(out, f"{key}_metrics.csv"))
         if cfg.eval.save_model:
-            save_model(c.neurofm, os.path.join(out, f"client_{c.client_id}_neurofm.pt"))
+            save_model(c.swin, os.path.join(out, f"client_{c.client_id}_swin.pt"))
 
     return results
 

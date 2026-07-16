@@ -14,7 +14,7 @@
   因此 FedAvg/FedProx/FAN/GPT-FL 都重新构建了 3 客户端的数据集划分。
 
 用法：
-  python experiments/run_all_baselines.py --config configs/m4fed.yaml [--dummy]
+  python experiments/run_all_baselines.py --config configs/m4fed.yaml
 """
 from __future__ import annotations    # 允许注解中使用尚未定义的类名
 import argparse                        # 命令行参数解析
@@ -49,8 +49,6 @@ def parse_args():
     """解析命令行参数：配置文件路径、是否虚拟模式、结果保存目录。"""
     p = argparse.ArgumentParser()   # 创建参数解析器
     p.add_argument("--config", default="configs/m4fed.yaml")   # 配置文件路径（默认 m4fed.yaml）
-    p.add_argument("--dummy", action="store_true",
-                   help="使用极小虚拟数据进行冒烟测试（秒级完成）")  # 快速冒烟测试模式
     p.add_argument("--results_dir", default="results")   # 结果保存根目录
     return p.parse_args()   # 解析并返回参数命名空间
 
@@ -92,7 +90,7 @@ def build_participants(cfg, node_datasets: dict, device: str, n_clients: int):
 
 def default_task_specs():
     """
-    返回默认任务规格字典（NeuroFM 多任务预测配置）。
+    返回默认任务规格字典（SwinMultiTask 多任务预测配置）。
 
     包含两个任务：
       age：回归任务，输出维度 1（直接预测年龄值）
@@ -102,8 +100,10 @@ def default_task_specs():
       任务规格字典（{task_name: {type: ..., n_classes: ...}}）
     """
     return {
-        "age": {"type": "regression", "n_classes": 1},       # 年龄回归（主任务）
-        "sex": {"type": "classification", "n_classes": 2},   # 性别分类（辅助任务）
+        "age":           {"type": "regression",     "n_classes": 1},  # 年龄回归（主任务）
+        "sex":           {"type": "classification", "n_classes": 2},  # 性别分类（辅助任务）
+        "health_status": {"type": "classification", "n_classes": 2},  # 健康状态分类（占位，n_classes 由数据决定）
+        "race":          {"type": "classification", "n_classes": 5},  # 种族分类（占位，n_classes 由数据决定）
     }
 
 
@@ -126,21 +126,18 @@ def main():
     # ------------------------------------------------------------------ #
     # 数据集准备                                                            #
     # ------------------------------------------------------------------ #
-    if args.dummy:
-        # 虚拟模式：生成 100 个假数据集 ID，MRI 尺寸缩小为 16³（秒级完成）
-        all_ds_ids = [f"ds{i:06d}" for i in range(100)]   # 假 ID 列表
-        mri_shape = (16, 16, 16)   # 极小分辨率（仅用于测试流程）
-    else:
-        # 正式模式：从 HuggingFace OpenMind 枚举真实数据集 ID
-        all_ds_ids = _load_openmind_ds_ids(cfg)   # 枚举 OpenMind 子数据集 ID
-        mri_shape = tuple(cfg.data.mri_shape)      # 从配置读取目标分辨率
+    all_ds_ids = _load_openmind_ds_ids(cfg)   # 枚举 OpenMind 子数据集 ID
+    mri_shape = tuple(cfg.data.mri_shape)      # 从配置读取目标分辨率
 
-    # 构建样本加载函数（非 dummy 模式下从 HuggingFace 下载 NIfTI + 元数据）
-    sample_loader_fn = None if args.dummy else make_openmind_sample_loader(
+    sample_loader_fn = make_openmind_sample_loader(
         cfg.data.hf_dataset_id,             # HuggingFace 数据集仓库 ID
         cache_dir=cfg.data.cache_dir or None,  # 本地缓存目录（None=使用默认）
         max_cache_gb=cfg.data.max_cache_gb,  # 最大缓存大小（GB，LRU 淘汰旧文件）
     )
+    # 用实际数据中统计到的类别数覆盖 task_specs 中的占位 n_classes
+    for field, n in getattr(sample_loader_fn, "n_classes", {}).items():
+        if field in task_specs and n > 0:
+            task_specs[field]["n_classes"] = n
 
     # 构建 M4Fed 专用划分（服务器公开+私有 + 2 个客户端私有）
     node_datasets = build_node_datasets(
@@ -151,10 +148,7 @@ def main():
         train_split=cfg.data.train_split,     # 训练/测试划分比例
         mri_shape=mri_shape,                  # MRI 目标分辨率
         seed=cfg.data.seed,                   # 划分随机种子
-        sample_loader_fn=sample_loader_fn,    # 样本加载函数（dummy 时为 None）
-        dummy_mode=args.dummy,                # 是否虚拟模式
-        n_dummy_per_ds=2 if args.dummy else 10,  # 每个虚拟数据集的样本数
-        n_public_max=cfg.data.n_public_ds_max,  # 公开数据集最大数量限制
+        sample_loader_fn=sample_loader_fn,
     )
 
     # 构建 3 客户端划分（FedAvg/FedProx/FAN/GPT-FL 共用同一划分）
@@ -167,9 +161,6 @@ def main():
         mri_shape=mri_shape,
         seed=cfg.data.seed,
         sample_loader_fn=sample_loader_fn,
-        dummy_mode=args.dummy,
-        n_dummy_per_ds=2 if args.dummy else 10,
-        n_public_max=cfg.data.n_public_ds_max,
     )
 
     # ------------------------------------------------------------------ #

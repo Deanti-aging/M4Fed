@@ -32,11 +32,8 @@ class DataConfig:
     n_cross_ds: int = 5
     # 每个节点（服务器 + 每个客户端）分配的私有子数据集数量
     n_private_ds_per_node: int = 20
-    # "公开"角色可分配的子数据集数量上限
-    # 背景：OpenMind 全量约 964GiB/114k 文件，在磁盘有限的机器上不能全部下载；
-    # 这里设置上限，多余的子数据集不参与任何角色（既不训练也不评估）
-    n_public_ds_max: int = 20
-    # 训练集占数据集的比例（剩余为测试集，如 0.9 = 90% 训练 + 10% 测试）
+    # 训练集占数据集的比例（如 0.9 = 90% 训练 + 10% 测试）
+    # 仅作用于私有数据集（服务器私有 + 各客户端私有）；公开数据全量作训练，不划分测试集
     train_split: float = 0.9
     # MRI 体积目标尺寸 (D, H, W)，单位为体素
     # field(default_factory=...) 为可变默认值（list）使用工厂函数，避免跨实例共享
@@ -57,7 +54,7 @@ class DataConfig:
 
 @dataclass
 class ModelConfig:
-    """模型结构与预训练权重相关配置（MedMD U-Net、VAE、NeuroFM、TabPFN 等）。"""
+    """模型结构与预训练权重相关配置（MedMD U-Net、VAE、SwinUNETR、TabPFN 等）。"""
     # VAE（MONAI AutoencoderKL）的 HuggingFace 仓库 ID
     # MONAI/brats_mri_generative_diffusion：3D 脑 MRI 专用 VAE，
     # spatial_dims=3，latent_channels=8，将 96³ 压缩为 12³×8 潜空间
@@ -80,8 +77,16 @@ class ModelConfig:
     unet_cross_attention_dim: int = 512
     # BioMedCLIP 文本编码器的 HuggingFace 仓库 ID（Microsoft 发布的生物医学 CLIP）
     biomedclip_repo: str = "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-    # NeuroFM 骨干网络的 HuggingFace 仓库 ID（UofG NeuroAI 发布的脑影像基础模型）
-    neurofm_repo: str = "NeuroAI-UofG/NeuroFM"
+    # SwinUNETR 骨干（swinViT）自监督预训练权重下载 URL
+    # 来源：MONAI 官方在脑 MRI（MSD 数据集）上自监督预训练的 checkpoint（Tang et al., CVPR 2022）
+    # 留空 "" 则跳过下载、使用随机初始化（仅用于调试或消融对照实验）
+    swinunetr_pretrain_url: str = (
+        "https://github.com/Project-MONAI/MONAI-extra-test-data/"
+        "releases/download/0.8.1/model_swinvit.pt"
+    )
+    # SwinUNETR 编码器基础特征维度（embed_dim = feature_size × 16，默认 48×16=768）
+    # 减小 feature_size 可降低显存占用（如测试时设为 12）
+    swinunetr_feature_size: int = 48
     # TabPFN 的 HuggingFace 仓库 ID（Prior-Labs 的元学习表格补全模型）
     tabpfn_repo: str = "Prior-Labs/tabpfn_2_5"
     # 扩散过程的总时间步数 T（训练时从 [1, T] 随机采样 t；T 越大扩散越充分）
@@ -119,9 +124,9 @@ class FederatedConfig:
     n_clients: int = 2
     # 热身阶段轮数（服务器用公开数据预训练 MedMD，使 U-Net 具备基本扩散能力）
     warm_rounds: int = 5
-    # 联邦循环轮数（客户端↔服务器交换合成 MRI 数据并更新 NeuroFM 的轮数）
+    # 联邦循环轮数（客户端↔服务器交换合成 MRI 数据并更新领域模型的轮数）
     federated_rounds: int = 10
-    # 本地训练阶段每个节点的训练轮数（Phase 3：使用合成 + 私有数据微调 NeuroFM）
+    # 本地训练阶段每个节点的训练轮数（Phase 3：使用合成 + 私有数据微调 SwinMultiTask）
     local_rounds: int = 10
     # 联邦循环阶段的合成数据比例（相对于本地私有数据量）
     # 0.1 = 合成 10% 的数据（较保守，避免联邦循环初期合成质量较低时引入噪声）
@@ -148,8 +153,8 @@ class TrainingConfig:
     batch_size: int = 1
     # MedMD 扩散模型 U-Net 的 AdamW 学习率
     lr_medmd: float = 1e-4
-    # NeuroFM 领域预测模型的 AdamW 学习率（比 MedMD 低一个数量级）
-    lr_neurofm: float = 5e-5
+    # SwinMultiTask 领域预测模型的 AdamW 学习率（比 MedMD 低一个数量级）
+    lr_swin: float = 5e-5
     # AdamW 优化器的权重衰减系数（L2 正则化，防止过拟合）
     weight_decay: float = 1e-5
     # 梯度裁剪阈值（防止梯度爆炸，特别是联邦训练中 Non-IID 数据导致的大梯度）
@@ -175,7 +180,7 @@ class EvalConfig:
     results_dir: str = "results"
     # 是否在训练结束后保存模型权重（.pt 文件）
     save_model: bool = True
-    # 是否在每轮联邦训练后进行一次 NeuroFM 评估（开启后训练更慢但更易发现过拟合）
+    # 是否在每轮联邦训练后进行一次领域模型（SwinMultiTask）评估（开启后训练更慢但更易发现过拟合）
     eval_every_round: bool = True
     # 图表保存格式：
     # "svg"  ── 矢量图，放大不失真，适合论文投稿（LaTeX/PDF 编译器直接嵌入）

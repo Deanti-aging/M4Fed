@@ -8,7 +8,7 @@
   - 5 个联邦基线方法（FedAvg/FedProx/FAN/GPT-FL/M4Fed）端对端完整流程
   - 消融研究（3 个组件变体，各自运行完整 M4Fed）
   - 敏感性分析（9 个超参数扫描点）
-  - 跨站点泛化实验（单次 NeuroFM 推理评估）
+  - 跨站点泛化实验（单次 SwinMultiTask 推理评估）
 
 所有测试使用真实 OpenMind 数据，MRI 裁剪为 32×32×32 加速推理。
 训练轮次均为 2（warm / federated / local rounds），目的是快速验证代码可运行
@@ -30,10 +30,9 @@ MRI_SHAPE = (32, 32, 32)
 
 class _Args:
     """模拟 argparse.Namespace，供实验函数使用（真实数据模式）。"""
-    dummy = False
 
 
-def _dummy_cfg():
+def _smoke_cfg():
     from configs.base_config import (
         M4FedConfig, DataConfig, ModelConfig, FederatedConfig,
         TrainingConfig, EvalConfig,
@@ -72,7 +71,7 @@ def _dummy_cfg():
     cfg.training = TrainingConfig(
         batch_size=1,
         lr_medmd=1e-3,
-        lr_neurofm=1e-3,
+        lr_swin=1e-3,
         mixed_precision=False,
         gradient_checkpointing=False,
         device=DEVICE,
@@ -99,7 +98,7 @@ def _load_real_ids(cfg):
 
 
 def _build_datasets(cfg, n_clients=2):
-    """使用真实 OpenMind 数据（MRI 裁剪为 32³）构建节点数据集。"""
+    """使用真实 OpenMind 数据（MRI 裁剪为 32³）构建节点数据集，同时返回 sample_fn（含 label_maps）。"""
     from data.openmind_dataset import build_node_datasets, make_openmind_sample_loader
     all_ids = _load_real_ids(cfg)
     sample_fn = make_openmind_sample_loader(
@@ -107,7 +106,7 @@ def _build_datasets(cfg, n_clients=2):
         cache_dir=cfg.data.cache_dir or None,
         max_cache_gb=cfg.data.max_cache_gb,
     )
-    return build_node_datasets(
+    nd = build_node_datasets(
         all_ds_ids=all_ids,
         n_cross=cfg.data.n_cross_ds,
         n_private_per_node=cfg.data.n_private_ds_per_node,
@@ -116,9 +115,18 @@ def _build_datasets(cfg, n_clients=2):
         mri_shape=MRI_SHAPE,
         seed=cfg.data.seed,
         sample_loader_fn=sample_fn,
-        dummy_mode=False,
-        n_public_max=cfg.data.n_public_ds_max,
     )
+    return nd, sample_fn
+
+
+def _build_task_specs(sample_fn):
+    """从 sample_fn.n_classes 构建完整任务规格字典（含正确的 n_classes）。"""
+    nc = getattr(sample_fn, "n_classes", {})
+    return {
+        "age":           {"type": "regression",     "n_classes": 1},
+        "health_status": {"type": "classification", "n_classes": max(2, nc.get("health_status", 2))},
+        "race":          {"type": "classification", "n_classes": max(2, nc.get("race", 5))},
+    }
 
 
 # ============================================================= #
@@ -128,14 +136,14 @@ def _build_datasets(cfg, n_clients=2):
 def test_fed_fedavg():
     """FedAvg 完整联邦学习流程（3 客户端，2 轮）。"""
     print("SMOKE: FedAvg end-to-end (3 clients, 2 rounds) ... ", end="")
-    cfg = _dummy_cfg()
-    nd  = _build_datasets(cfg, n_clients=3)
+    cfg = _smoke_cfg()
+    nd, sample_fn = _build_datasets(cfg, n_clients=3)
     from federated.server import Server
     from federated.client import Client
     from federated.methods.fedavg import run_fedavg
     server  = Server(cfg, nd["server_private"], nd["server_public"], DEVICE)
     clients = [Client(i, cfg, nd[f"client_{i}"], DEVICE) for i in range(3)]
-    task_specs = {"age": {"type": "regression", "n_classes": 1}}
+    task_specs = _build_task_specs(sample_fn)
     res = run_fedavg(server, clients, cfg, task_specs, "results/test")
     assert "clients_mean" in res
     print("PASS")
@@ -144,14 +152,14 @@ def test_fed_fedavg():
 def test_fed_fedprox():
     """FedProx 完整联邦学习流程（3 客户端，2 轮）。"""
     print("SMOKE: FedProx end-to-end (3 clients, 2 rounds) ... ", end="")
-    cfg = _dummy_cfg()
-    nd  = _build_datasets(cfg, n_clients=3)
+    cfg = _smoke_cfg()
+    nd, sample_fn = _build_datasets(cfg, n_clients=3)
     from federated.server import Server
     from federated.client import Client
     from federated.methods.fedprox import run_fedprox
     server  = Server(cfg, nd["server_private"], nd["server_public"], DEVICE)
     clients = [Client(i, cfg, nd[f"client_{i}"], DEVICE) for i in range(3)]
-    task_specs = {"age": {"type": "regression", "n_classes": 1}}
+    task_specs = _build_task_specs(sample_fn)
     res = run_fedprox(server, clients, cfg, task_specs, "results/test")
     assert "clients_mean" in res
     print("PASS")
@@ -160,14 +168,14 @@ def test_fed_fedprox():
 def test_fed_fan():
     """FAN 完整联邦学习流程（3 客户端，2 轮）。"""
     print("SMOKE: FAN end-to-end (3 clients, 2 rounds) ... ", end="")
-    cfg = _dummy_cfg()
-    nd  = _build_datasets(cfg, n_clients=3)
+    cfg = _smoke_cfg()
+    nd, sample_fn = _build_datasets(cfg, n_clients=3)
     from federated.server import Server
     from federated.client import Client
     from federated.methods.fan import run_fan
     server  = Server(cfg, nd["server_private"], nd["server_public"], DEVICE)
     clients = [Client(i, cfg, nd[f"client_{i}"], DEVICE) for i in range(3)]
-    task_specs = {"age": {"type": "regression", "n_classes": 1}}
+    task_specs = _build_task_specs(sample_fn)
     res = run_fan(server, clients, cfg, task_specs, "results/test")
     assert "clients_mean" in res
     print("PASS")
@@ -176,14 +184,14 @@ def test_fed_fan():
 def test_fed_gptfl():
     """GPT-FL 完整联邦学习流程（3 客户端，2 轮）。"""
     print("SMOKE: GPT-FL end-to-end (3 clients, 2 rounds) ... ", end="")
-    cfg = _dummy_cfg()
-    nd  = _build_datasets(cfg, n_clients=3)
+    cfg = _smoke_cfg()
+    nd, sample_fn = _build_datasets(cfg, n_clients=3)
     from federated.server import Server
     from federated.client import Client
     from federated.methods.gptfl import run_gptfl
     server  = Server(cfg, nd["server_private"], nd["server_public"], DEVICE)
     clients = [Client(i, cfg, nd[f"client_{i}"], DEVICE) for i in range(3)]
-    task_specs = {"age": {"type": "regression", "n_classes": 1}}
+    task_specs = _build_task_specs(sample_fn)
     res = run_gptfl(server, clients, cfg, task_specs, "results/test",
                     pretrained_medmd_path=None)
     assert "clients_mean" in res
@@ -193,14 +201,14 @@ def test_fed_gptfl():
 def test_fed_m4fed():
     """M4Fed 三阶段完整联邦学习流程（2 客户端，2 轮）。"""
     print("SMOKE: M4Fed end-to-end (2 clients, 2 rounds) ... ", end="")
-    cfg = _dummy_cfg()
-    nd  = _build_datasets(cfg, n_clients=2)
+    cfg = _smoke_cfg()
+    nd, sample_fn = _build_datasets(cfg, n_clients=2)
     from federated.server import Server
     from federated.client import Client
     from federated.methods.m4fed import run_m4fed
     server  = Server(cfg, nd["server_private"], nd["server_public"], DEVICE)
     clients = [Client(i, cfg, nd[f"client_{i}"], DEVICE) for i in range(2)]
-    task_specs = {"age": {"type": "regression", "n_classes": 1}}
+    task_specs = _build_task_specs(sample_fn)
     res = run_m4fed(server, clients, cfg, task_specs, "results/test")
     assert "clients_mean" in res
     print("PASS")
@@ -211,12 +219,16 @@ def test_fed_m4fed():
 # ============================================================= #
 
 def test_ablation():
-    """消融实验：3 个组件变体（无公开数据 / 无 TabPFN / 随机初始化 NeuroFM）。"""
+    """消融实验：3 个组件变体（无公开数据 / 无 TabPFN / 随机初始化 SwinUNETR）。"""
     print("SMOKE: Ablation study (3 variants) ... ", end="")
-    cfg = _dummy_cfg()
+    cfg = _smoke_cfg()
     all_ids = _load_real_ids(cfg)
     from experiments.ablation import run_ablation
-    task_specs = {"age": {"type": "regression", "n_classes": 1}}
+    task_specs = {
+        "age":           {"type": "regression",     "n_classes": 1},
+        "health_status": {"type": "classification", "n_classes": 2},
+        "race":          {"type": "classification", "n_classes": 5},
+    }
     res = run_ablation(_Args(), cfg, all_ids, MRI_SHAPE, task_specs, "results/test")
     assert len(res) == 3
     print("PASS")
@@ -229,10 +241,14 @@ def test_ablation():
 def test_sensitivity():
     """敏感性分析：扫描合成比例 / MedMD 学习率 / Dirichlet α，共 9 个配置点。"""
     print("SMOKE: Sensitivity analysis (9 configs) ... ", end="")
-    cfg = _dummy_cfg()
+    cfg = _smoke_cfg()
     all_ids = _load_real_ids(cfg)
     from experiments.sensitivity import run_sensitivity
-    task_specs = {"age": {"type": "regression", "n_classes": 1}}
+    task_specs = {
+        "age":           {"type": "regression",     "n_classes": 1},
+        "health_status": {"type": "classification", "n_classes": 2},
+        "race":          {"type": "classification", "n_classes": 5},
+    }
     res = run_sensitivity(_Args(), cfg, all_ids, MRI_SHAPE, task_specs, "results/test")
     assert len(res) == 9
     print("PASS")
@@ -243,9 +259,9 @@ def test_sensitivity():
 # ============================================================= #
 
 def test_cross_site():
-    """跨站点泛化：在真实跨站点数据上评估 NeuroFM 端对端推理流程。"""
+    """跨站点泛化：在真实跨站点数据上评估 SwinMultiTask 端对端推理流程。"""
     print("SMOKE: Cross-site generalisation ... ", end="")
-    cfg = _dummy_cfg()
+    cfg = _smoke_cfg()
     nd = _build_datasets(cfg, n_clients=2)
     cross_ds = nd["cross"]["all"]
     from experiments.cross_site import run_cross_site
