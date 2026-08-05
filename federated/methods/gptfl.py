@@ -27,6 +27,9 @@ from typing import List
 
 from training.swin_trainer import SwinTrainer
 from evaluation.metrics import compute_domain_metrics
+from evaluation.generative_eval import (                 # 生成模型评估与汇总工具
+    evaluate_generative_model, aggregate_metrics, save_summary, save_loss_summary,
+)
 from data.openmind_dataset import OpenMindDataset, make_dataloader
 from utils.io_utils import save_csv, save_model, ensure_dir, load_model
 from utils.timing_utils import record_timing
@@ -174,7 +177,7 @@ def run_gptfl(
 
     record_timing("gptfl/train", time.perf_counter() - _train_t0)
 
-    # ---- 评估阶段 ----
+    # ---- 领域模型评估阶段（脑年龄预测：MAE / RMSE / Pearson r / R²） ----
     _eval_t0 = time.perf_counter()
     results = {}
     for c in clients:
@@ -184,23 +187,55 @@ def run_gptfl(
         results[f"client_{c.client_id}"] = compute_domain_metrics(y_true, y_pred)
     record_timing("gptfl/eval", time.perf_counter() - _eval_t0)
 
-    # 汇总跨客户端指标的均值和标准差
+    # 汇总跨客户端领域指标的均值和标准差
     client_keys = [f"client_{c.client_id}" for c in clients]
     agg = _agg({k: results[k] for k in client_keys})
     results["clients_mean"] = agg["mean"]
     results["clients_std"] = agg["std"]
 
+    # ---- 生成模型评估阶段（PSNR / SSIM / LPIPS / FID / KID） ----
+    # GPT-FL 采用集中式生成：生成模型仅存在于 server（clients 消费其合成数据，
+    # 自身不训练生成模型）。因此以 server.medmd 作为唯一生成模型，分别对
+    # server 与各 client 的真实测试数据评估，得到"分 server 和 client"的生成指标。
+    _gen_t0 = time.perf_counter()
+    gen_results = {}
+    gen_results["server"] = evaluate_generative_model(
+        server.medmd, server.test_loader, cfg, device)   # server 生成模型 vs server 数据
+    for c in clients:
+        gen_results[f"client_{c.client_id}"] = evaluate_generative_model(
+            server.medmd, c.test_loader, cfg, device)     # 共享生成模型 vs client 数据
+    gen_agg = aggregate_metrics({k: gen_results[k] for k in client_keys})
+    gen_results["clients_mean"] = gen_agg["mean"]
+    gen_results["clients_std"] = gen_agg["std"]
+    results["gen"] = gen_results
+    record_timing("gptfl/gen_eval", time.perf_counter() - _gen_t0)
+
     # ---- 保存结果到磁盘 ----
     save_csv(pd.DataFrame(warmup_losses),
              os.path.join(out, "server_warmup_losses.csv"))
+    save_csv(pd.DataFrame([gen_results["server"]]),
+             os.path.join(out, "server_gen_metrics.csv"))   # server 生成指标
     for c in clients:
         key = f"client_{c.client_id}"
         save_csv(pd.DataFrame(all_losses[key]),
                  os.path.join(out, f"{key}_losses.csv"))
         save_csv(pd.DataFrame([results[key]]),
                  os.path.join(out, f"{key}_metrics.csv"))
+        save_csv(pd.DataFrame([gen_results[key]]),
+                 os.path.join(out, f"{key}_gen_metrics.csv"))   # client 生成指标
         if cfg.eval.save_model:
-            save_model(c.swin, os.path.join(out, f"client_{c.client_id}_swin.pt"))
+            save_model(c.swin, os.path.join(out, f"{key}_swin.pt"))   # 领域模型权重
+
+    if cfg.eval.save_model:
+        save_model(server.medmd, os.path.join(out, "server_medmd.pt"))  # 生成模型权重（server）
+
+    # 跨客户端汇总 CSV：领域指标、生成指标、逐轮损失的 mean/std
+    save_summary(results["clients_mean"], results["clients_std"],
+                 os.path.join(out, "clients_domain_summary.csv"))
+    save_summary(gen_results["clients_mean"], gen_results["clients_std"],
+                 os.path.join(out, "clients_gen_summary.csv"))
+    save_loss_summary({k: all_losses[k] for k in client_keys},
+                      os.path.join(out, "clients_loss_summary.csv"))
 
     return results
 

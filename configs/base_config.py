@@ -38,6 +38,9 @@ class DataConfig:
     # MRI 体积目标尺寸 (D, H, W)，单位为体素
     # field(default_factory=...) 为可变默认值（list）使用工厂函数，避免跨实例共享
     mri_shape: List[int] = field(default_factory=lambda: [96, 96, 96])
+    # 3D 随机裁剪保留的边长比例（相对 mri_shape，裁剪后插值回原尺寸）
+    # 0.875 表示 96³ → 裁剪 84³ 子体积 → 插值回 96³（等效随机平移 + 轻微放大）
+    augment_crop_ratio: float = 0.875
     # 数据集划分的随机种子（影响 cross/private/public 的 ID 分配和 train/test 划分）
     seed: int = 42
     # 是否使用 HuggingFace 流式加载（不预下载全部数据，边训练边下载）
@@ -50,6 +53,10 @@ class DataConfig:
     # 优先从此文件读取子数据集 ID（覆盖全量 800 个 ds_id，无需 HuggingFace API 请求）
     # 留空 "" 时退回通过 HuggingFace 元数据接口获取
     local_metadata_csv: str = "openneuro_metadata.csv"
+    # 挑选 cross（跨站点评估）数据集时，age/sex/health_status 各字段允许的最大缺失率
+    # 超过该阈值的 ds_id 会被跳过（换成下一个候选），避免跨站点偏差分析（性别/健康状态×年龄
+    # 误差热图）因样本量过少而不可靠；仅在能读取本地 local_metadata_csv 时生效
+    cross_max_missing_ratio: float = 0.5
 
 
 @dataclass
@@ -136,6 +143,12 @@ class FederatedConfig:
     synth_ratio_local: float = 1.0
     # FedProx 近端正则化系数 μ（0 = 退化为 FedAvg，μ 越大本地更新越保守）
     fedprox_mu: float = 0.001
+    # ---- FAN 热身阶段的标签平衡过采样参数 ----
+    # 年龄分箱宽度（岁）：脑龄是连续标签，先按该宽度分箱再按箱内计数做平衡过采样
+    fan_age_bin_width: float = 10.0
+    # 单个样本允许的最大重复倍数：防止极稀有年龄段（如仅 1 个 80 岁样本）被复制上百次，
+    # 导致增强也无法提供足够多样性、反而引发严重过拟合
+    fan_oversample_cap: int = 5
     # QLoRA 低秩矩阵的秩 r（越小参数越少，通信效率越高，但表达能力越弱）
     qlora_r: int = 16
     # QLoRA 缩放系数 α（实际学习率缩放比例 = α/r；α=2r 是常见选择）
@@ -182,6 +195,12 @@ class EvalConfig:
     save_model: bool = True
     # 是否在每轮联邦训练后进行一次领域模型（SwinMultiTask）评估（开启后训练更慢但更易发现过拟合）
     eval_every_round: bool = True
+    # 生成模型（MedMD）质量评估参与的最大样本数（PSNR/SSIM/LPIPS/FID/KID）
+    # 每个样本需一次 img2img 合成（ddim_steps 步去噪），值越大评估越慢，故设上限控制耗时
+    gen_eval_max_samples: int = 16
+    # 生成模型评估的 img2img 噪声强度（评估阶段固定值，独立于训练/联邦阶段的噪声区间）
+    # 取中等强度：既改变足够多细节以体现生成能力，又保留结构使配对指标有意义
+    gen_eval_noise_strength: float = 0.5
     # 图表保存格式：
     # "svg"  ── 矢量图，放大不失真，适合论文投稿（LaTeX/PDF 编译器直接嵌入）
     # "pdf"  ── 矢量图，PDF 阅读器直接打开

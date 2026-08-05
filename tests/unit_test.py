@@ -5,8 +5,9 @@
          python main.py --mode test
 
 与 main.py 实验范围一致，包含 8 个冒烟测试：
-  - 5 个联邦基线方法（FedAvg/FedProx/FAN/GPT-FL/M4Fed）端对端完整流程
-  - 消融研究（3 个组件变体，各自运行完整 M4Fed）
+  - 5 个联邦基线方法（FedAvg/FedProx/FAN/M4Fed/GPT-FL）端对端完整流程，
+    M4Fed 需先于 GPT-FL 运行以提供预训练 MedMD
+  - 消融研究（4 个变体，各自运行完整 M4Fed）
   - 敏感性分析（9 个超参数扫描点）
   - 跨站点泛化实验（单次 SwinMultiTask 推理评估）
 
@@ -124,6 +125,7 @@ def _build_task_specs(sample_fn):
     nc = getattr(sample_fn, "n_classes", {})
     return {
         "age":           {"type": "regression",     "n_classes": 1},
+        "sex":           {"type": "classification", "n_classes": 2},
         "health_status": {"type": "classification", "n_classes": max(2, nc.get("health_status", 2))},
         "race":          {"type": "classification", "n_classes": max(2, nc.get("race", 5))},
     }
@@ -181,27 +183,15 @@ def test_fed_fan():
     print("PASS")
 
 
-def test_fed_gptfl():
-    """GPT-FL 完整联邦学习流程（3 客户端，2 轮）。"""
-    print("SMOKE: GPT-FL end-to-end (3 clients, 2 rounds) ... ", end="")
-    cfg = _smoke_cfg()
-    nd, sample_fn = _build_datasets(cfg, n_clients=3)
-    from federated.server import Server
-    from federated.client import Client
-    from federated.methods.gptfl import run_gptfl
-    server  = Server(cfg, nd["server_private"], nd["server_public"], DEVICE)
-    clients = [Client(i, cfg, nd[f"client_{i}"], DEVICE) for i in range(3)]
-    task_specs = _build_task_specs(sample_fn)
-    res = run_gptfl(server, clients, cfg, task_specs, "results/test",
-                    pretrained_medmd_path=None)
-    assert "clients_mean" in res
-    print("PASS")
-
-
 def test_fed_m4fed():
-    """M4Fed 三阶段完整联邦学习流程（2 客户端，2 轮）。"""
+    """M4Fed 三阶段完整联邦学习流程（2 客户端，2 轮）。
+
+    先于 GPT-FL 运行并开启 save_model，使服务器热身阶段训练好的 MedMD
+    权重（server_medmd.pt）落盘，供 test_fed_gptfl 复用为生成模型。
+    """
     print("SMOKE: M4Fed end-to-end (2 clients, 2 rounds) ... ", end="")
     cfg = _smoke_cfg()
+    cfg.eval.save_model = True
     nd, sample_fn = _build_datasets(cfg, n_clients=2)
     from federated.server import Server
     from federated.client import Client
@@ -214,23 +204,48 @@ def test_fed_m4fed():
     print("PASS")
 
 
+def test_fed_gptfl():
+    """GPT-FL 完整联邦学习流程（3 客户端，2 轮）。
+
+    复用 test_fed_m4fed 热身阶段保存的服务器 MedMD 权重作为生成模型
+    （与 experiments/run_all_baselines.py 中 m4fed → gptfl 的接力方式一致），
+    因此必须在 test_fed_m4fed 之后运行。
+    """
+    print("SMOKE: GPT-FL end-to-end (3 clients, 2 rounds) ... ", end="")
+    cfg = _smoke_cfg()
+    nd, sample_fn = _build_datasets(cfg, n_clients=3)
+    from federated.server import Server
+    from federated.client import Client
+    from federated.methods.gptfl import run_gptfl
+    server  = Server(cfg, nd["server_private"], nd["server_public"], DEVICE)
+    clients = [Client(i, cfg, nd[f"client_{i}"], DEVICE) for i in range(3)]
+    task_specs = _build_task_specs(sample_fn)
+    m4fed_medmd_path = os.path.join("results/test", "m4fed", "server_medmd.pt")
+    res = run_gptfl(server, clients, cfg, task_specs, "results/test",
+                    pretrained_medmd_path=m4fed_medmd_path)
+    assert "clients_mean" in res
+    print("PASS")
+
+
 # ============================================================= #
 #  2. 消融研究冒烟测试                                              #
 # ============================================================= #
 
 def test_ablation():
-    """消融实验：3 个组件变体（无公开数据 / 无 TabPFN / 随机初始化 SwinUNETR）。"""
-    print("SMOKE: Ablation study (3 variants) ... ", end="")
+    """消融实验：4 个变体（无公开数据 / 无 TabPFN / 随机初始化 SwinUNETR / 训练数据仅用健康人）。"""
+    print("SMOKE: Ablation study (4 variants) ... ", end="")
     cfg = _smoke_cfg()
     all_ids = _load_real_ids(cfg)
     from experiments.ablation import run_ablation
     task_specs = {
         "age":           {"type": "regression",     "n_classes": 1},
+        "sex":           {"type": "classification", "n_classes": 2},
         "health_status": {"type": "classification", "n_classes": 2},
         "race":          {"type": "classification", "n_classes": 5},
     }
     res = run_ablation(_Args(), cfg, all_ids, MRI_SHAPE, task_specs, "results/test")
-    assert len(res) == 3
+    assert len(res) == 4
+    assert "health_subset_eval" in res["only_healthy_train"]
     print("PASS")
 
 
@@ -246,6 +261,7 @@ def test_sensitivity():
     from experiments.sensitivity import run_sensitivity
     task_specs = {
         "age":           {"type": "regression",     "n_classes": 1},
+        "sex":           {"type": "classification", "n_classes": 2},
         "health_status": {"type": "classification", "n_classes": 2},
         "race":          {"type": "classification", "n_classes": 5},
     }
@@ -274,8 +290,8 @@ ALL_TESTS = [
     test_fed_fedavg,
     test_fed_fedprox,
     test_fed_fan,
-    test_fed_gptfl,
     test_fed_m4fed,
+    test_fed_gptfl,
     test_ablation,
     test_sensitivity,
     test_cross_site,

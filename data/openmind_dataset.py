@@ -17,7 +17,6 @@ from __future__ import annotations    # 允许注解中使用尚未定义的类�
 import os                              # 路径操作（makedirs、join、exists 等）
 import io                              # 字节流（未来扩展用，当前版本未直接使用）
 import re                              # 正则表达式（提取 dsXXXXXX 文件夹名）
-import random                          # 随机数生成（数据增强的翻转概率）
 import time                            # 时间戳记录（LRU 缓存的访问时间）
 import numpy as np                     # NumPy（MRI 数组操作、随机噪声生成）
 import pandas as pd                    # Pandas（元数据表格处理）
@@ -172,18 +171,27 @@ class OpenMindDataset(Dataset):
         mri_shape: Tuple[int, int, int] = (96, 96, 96),  # 预处理后 MRI 目标尺寸
         augment: bool = False,                    # 是否在 __getitem__ 时进行 3D 数据增强
         seed: int = 42,                           # 数据增强的随机种子
+        augment_crop_ratio: float = 0.875,        # 随机裁剪保留的边长比例（相对 mri_shape）
     ):
         """
         参数：
           samples   : 样本字典列表（每个元素是一个包含 mri_path/mri_array/table_text/age/metadata 的字典）
           mri_shape : 预处理后 MRI 体积的目标尺寸 (D, H, W)（深度/高度/宽度）
-          augment   : 是否在 __getitem__ 时进行 3D 随机翻转数据增强（训练时开启）
-          seed      : 随机种子（用于数据增强的确定性初始化）
+          augment   : 是否在 __getitem__ 时进行 3D 数据增强（训练时开启，见 _build_augment_pipeline）
+          seed      : 随机种子（传给 MONAI Compose 的 set_random_state，保证增强序列可复现）
+          augment_crop_ratio : 随机裁剪的边长保留比例（裁剪后会插值回 mri_shape）
+
+        注意：augment=True 但环境中没有 MONAI 时直接抛 ImportError，
+        而不是静默退化成"无增强"——后者会让实验结果与配置不符且无任何提示。
         """
         self.samples = samples              # 保存样本列表（可在消融实验中直接修改 .samples）
         self.mri_shape = tuple(mri_shape)  # 目标 MRI 分辨率（转为元组确保不可变）
         self.augment = augment              # 数据增强开关
-        self.rng = random.Random(seed)     # 独立随机状态（用于增强的随机翻转决策）
+        self.seed = seed                    # 随机种子（供增强流水线使用）
+        self.augment_crop_ratio = augment_crop_ratio   # 随机裁剪比例
+        # 增强流水线只在 __init__ 构造一次：MONAI 随机变换的随机状态保存在变换对象内部，
+        # 若每次 __getitem__ 重新构造，随机状态会被重置且 seed 完全失效
+        self._aug = self._build_augment_pipeline() if augment else None
 
     def __len__(self) -> int:
         """返回数据集样本总数（PyTorch DataLoader 用于确定 epoch 长度）。"""
@@ -210,9 +218,9 @@ class OpenMindDataset(Dataset):
         # 步骤 2：MRI 预处理（百分位裁剪 → [-1,1] 归一化 → 插值到目标尺寸）
         mri_tensor = preprocess_mri(vol, self.mri_shape)  # 输出形状：(1, D, H, W)
 
-        # 步骤 3：可选的 3D 数据增强（随机翻转，减少过拟合）
+        # 步骤 3：可选的 3D 数据增强（翻转/旋转/缩放/弹性形变/裁剪，减少过拟合）
         if self.augment:
-            mri_tensor = self._augment_3d(mri_tensor)   # MONAI 随机翻转
+            mri_tensor = self._augment_3d(mri_tensor)   # MONAI 增强流水线
 
         # 步骤 4：构造年龄标签张量
         age = s.get("age", None)   # 从样本字典获取年龄值（可能为 None/float/int）
@@ -319,35 +327,89 @@ class OpenMindDataset(Dataset):
 
         return target_path   # 返回本地文件绝对路径
 
-    def _augment_3d(self, t: torch.Tensor) -> torch.Tensor:
+    def _build_augment_pipeline(self):
         """
-        使用 MONAI 实现 3D 随机翻转增强（沿 3 个空间轴各 50% 概率翻转）。
+        构造 MONAI 3D 数据增强流水线（只在 __init__ 中调用一次）。
 
-        MONAI 增强原理：RandFlipd 在 Dict 模式下对指定 key（"img"）进行随机翻转，
-        spatial_axis 指定翻转轴（0=深度 D, 1=高度 H, 2=宽度 W）。
+        流水线包含 5 类变换（顺序执行，各自带独立触发概率）：
+          1. 随机翻转   RandFlipd    —— 沿 D/H/W 三轴各 50% 概率翻转
+          2. 随机旋转   RandRotated  —— 30% 概率，三轴各 ±15°（0.26 弧度）真 3D 旋转
+          3. 随机缩放   RandZoomd    —— 30% 概率，0.9~1.1 倍缩放（keep_size 保持尺寸）
+          4. 弹性形变   Rand3DElasticd —— 20% 概率，模拟解剖结构的非刚性个体差异
+          5. 随机裁剪   RandSpatialCropd + Resized —— 裁剪 augment_crop_ratio 的子体积后插值回原尺寸
 
-        若 MONAI 未安装则直接返回原张量（跳过增强，不抛出异常），
-        以保证代码在无 MONAI 的环境下也能运行。
-
-        参数：
-          t : (1, D, H, W) float32 MRI 张量
+        几个关键实现细节：
+          - padding_mode 统一用 "border"/"edge" 而非 "zeros"：预处理后体素值域为 [-1, 1]，
+            背景是 -1 而不是 0，用 0 填充会在脑外区域造出一圈灰色伪影
+          - 末尾的 Resized 保证输出恒为 mri_shape，使 _collate_fn 的 torch.stack 不会因尺寸不一而报错
+          - set_random_state(seed) 递归设置所有子变换的随机状态，使增强序列可复现
 
         返回：
-          增强后的 (1, D, H, W) 张量（MONAI 可用时）或原张量（MONAI 不可用时）
+          MONAI Compose 对象（输入/输出均为 {"img": tensor} 字典）
         """
         try:
             from monai.transforms import (
-                RandFlipd, RandRotate90d, RandAffined, Compose   # MONAI 数据增强变换
+                Compose, RandFlipd, RandRotated, RandZoomd,
+                Rand3DElasticd, RandSpatialCropd, Resized,
             )
-            transforms = Compose([
-                RandFlipd(keys=["img"], prob=0.5, spatial_axis=0),  # 50% 概率沿深度轴翻转
-                RandFlipd(keys=["img"], prob=0.5, spatial_axis=1),  # 50% 概率沿高度轴翻转
-                RandFlipd(keys=["img"], prob=0.5, spatial_axis=2),  # 50% 概率沿宽度轴翻转
-            ])
-            out = transforms({"img": t})   # 以 Dict 格式传入（MONAI Dict 变换的输入格式）
-            return out["img"]              # 取出增强后的张量
-        except Exception:
-            return t   # MONAI 不可用或增强失败时返回原始张量（静默跳过增强）
+        except ImportError as e:
+            raise ImportError(
+                "OpenMindDataset(augment=True) 需要安装 MONAI 才能进行 3D 数据增强，"
+                "请执行 `pip install monai`。（如需关闭增强请显式传 augment=False）"
+            ) from e
+
+        # 随机裁剪的子体积尺寸（各轴按 augment_crop_ratio 缩短，至少为 1 体素）
+        crop_size = tuple(max(1, int(round(s * self.augment_crop_ratio)))
+                          for s in self.mri_shape)
+
+        pipeline = Compose([
+            # ---- 1. 随机翻转（沿 3 个空间轴，各 50% 概率）----
+            RandFlipd(keys=["img"], prob=0.5, spatial_axis=0),  # 深度轴 D
+            RandFlipd(keys=["img"], prob=0.5, spatial_axis=1),  # 高度轴 H
+            RandFlipd(keys=["img"], prob=0.5, spatial_axis=2),  # 宽度轴 W
+            # ---- 2. 随机 3D 旋转（三轴各 ±15°，双线性插值，边界复制填充）----
+            RandRotated(
+                keys=["img"], prob=0.3,
+                range_x=0.26, range_y=0.26, range_z=0.26,   # 弧度制：0.26 rad ≈ 15°
+                mode="bilinear", padding_mode="border", keep_size=True,
+            ),
+            # ---- 3. 随机缩放（0.9~1.1 倍，keep_size=True 时自动裁剪/填充回原尺寸）----
+            RandZoomd(
+                keys=["img"], prob=0.3, min_zoom=0.9, max_zoom=1.1,
+                mode="trilinear", padding_mode="edge", keep_size=True,
+            ),
+            # ---- 4. 3D 弹性形变（模拟个体解剖差异；概率较低因为计算开销最大）----
+            Rand3DElasticd(
+                keys=["img"], prob=0.2,
+                sigma_range=(5, 8),          # 高斯平滑核标准差范围（越大形变越平滑）
+                magnitude_range=(50, 120),   # 形变位移幅度范围（体素）
+                mode="bilinear", padding_mode="border",
+            ),
+            # ---- 5. 随机裁剪 + 插值回目标尺寸（等效于随机平移 + 轻微放大）----
+            RandSpatialCropd(keys=["img"], roi_size=crop_size, random_size=False),
+            Resized(keys=["img"], spatial_size=self.mri_shape, mode="trilinear"),
+        ])
+        # 设置随机状态（递归传播到所有 Randomizable 子变换），保证增强序列可复现
+        pipeline.set_random_state(seed=self.seed)
+        return pipeline
+
+    def _augment_3d(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        对单个 MRI 张量应用 __init__ 中构造好的增强流水线。
+
+        参数：
+          t : (1, D, H, W) float32 MRI 张量，值域 [-1, 1]
+
+        返回：
+          增强后的 (1, D, H, W) float32 普通张量（已从 MetaTensor 转回，避免元数据进入 collate）
+        """
+        out = self._aug({"img": t})   # MONAI Dict 变换的输入/输出格式
+        img = out["img"]
+        # MONAI ≥ 1.0 返回 MetaTensor（torch.Tensor 子类，附带 affine 等元数据）；
+        # 转回普通张量，避免元数据在 torch.stack / pin_memory 阶段引发额外开销或告警
+        if hasattr(img, "as_tensor"):
+            img = img.as_tensor()
+        return img.float()
 
 
 # =========================================================================== #
@@ -415,6 +477,50 @@ def list_ds_ids_from_metadata(
     df = df[df["age"].notna()]                             # 排除 age 缺失的受试者
     ds_ids = df["image_path"].str.split("/").str[0].dropna().unique()
     return sorted(ds_ids.tolist())
+
+
+def _missing_ratio_by_ds_id(
+    df: pd.DataFrame,
+    fields: Tuple[str, ...],
+) -> Dict[str, Dict[str, float]]:
+    """按 ds_id 分组，统计 fields 中每个字段的缺失（NaN）比例。内部辅助函数。"""
+    ds_col = df["ds_id"] if "ds_id" in df.columns else df["image_path"].str.split("/").str[0]
+    stats: Dict[str, Dict[str, float]] = {}
+    for ds_id, idx in df.groupby(ds_col).groups.items():
+        g = df.loc[idx]
+        stats[str(ds_id)] = {
+            f: (float(g[f].isna().mean()) if f in g.columns else 1.0)  # 字段不存在时视为全缺失
+            for f in fields
+        }
+    return stats
+
+
+def compute_ds_quality_stats(
+    csv_path: str,
+    modality: str = "T1w",
+    fields: Tuple[str, ...] = ("age", "sex", "health_status"),
+) -> Dict[str, Dict[str, float]]:
+    """
+    从本地 openneuro_metadata.csv 按 ds_id 统计给定字段的缺失率，供 cross 数据集质量筛选使用。
+
+    过滤口径与 list_ds_ids_from_metadata 一致（同一份 modality 筛选后的表），
+    保证两者统计的 ds_id 集合对齐；返回值可直接传给
+    assign_ds_splits(..., quality_stats=...) 或 build_node_datasets(..., quality_stats=...)。
+
+    参数：
+      csv_path : 本地 openneuro_metadata.csv 的文件路径
+      modality : 保留的 MRI 模态（传 None 则不按模态过滤，需与 list_ds_ids_from_metadata 调用一致）
+      fields   : 需要统计缺失率的字段名（默认年龄/性别/健康状态）
+
+    返回：
+      {ds_id: {field: missing_ratio, ...}, ...}，missing_ratio 为该 ds_id 内该字段 NaN 的比例
+    """
+    from data.preprocessing import preprocess_table
+    df = pd.read_csv(csv_path)
+    df = preprocess_table(df)
+    if modality is not None:
+        df = df[df["modality"] == modality]
+    return _missing_ratio_by_ds_id(df, fields)
 
 
 # =========================================================================== #
@@ -586,6 +692,9 @@ def build_node_datasets(
     mri_shape: Tuple[int, int, int],  # MRI 体积目标尺寸（D, H, W）
     seed: int,                        # 随机种子（数据划分 + DataLoader shuffle）
     sample_loader_fn=None,            # 可调用对象：ds_id → List[dict]（必须提供）
+    quality_stats: Optional[Dict[str, Dict[str, float]]] = None,  # {ds_id: {field: missing_ratio}}，见 compute_ds_quality_stats
+    max_missing_ratio: float = 0.5,   # quality_stats 各字段缺失率的最大允许值，透传给 assign_ds_splits
+    return_split_ids: bool = False,   # True 时额外返回 assign_ds_splits 的角色→ds_id 分配结果
 ) -> Dict[str, Dict[str, "OpenMindDataset"]]:
     """
     根据数据集 ID 分配方案，构建各联邦节点的训练/测试数据集。
@@ -609,6 +718,11 @@ def build_node_datasets(
       mri_shape         : MRI 体积预处理目标尺寸（如 (96, 96, 96)）
       seed              : 随机种子（保证数据划分可复现）
       sample_loader_fn  : 真实数据加载函数（必须提供）
+      quality_stats     : 可选，{ds_id: {field: missing_ratio}}（见 compute_ds_quality_stats），
+                          用于在挑选 cross 数据集时按缺失率二次把关；不传则不做质量过滤
+      max_missing_ratio : quality_stats 各字段缺失率的最大允许值（默认 0.5，即 50%）
+      return_split_ids  : True 时返回 (result, split_ids) 二元组，split_ids 为
+                          assign_ds_splits 的角色→ds_id 分配结果（供调用方记录 cross 用了哪些 ds_id）
     """
     _build_t0 = time.perf_counter()   # 记录构建开始时间（用于耗时统计）
 
@@ -616,6 +730,7 @@ def build_node_datasets(
     # assign_ds_splits 返回 {role: [ds_id, ...]} 字典
     split_ids = assign_ds_splits(
         all_ds_ids, n_cross, n_private_per_node, n_clients, seed,
+        quality_stats=quality_stats, max_missing_ratio=max_missing_ratio,
     )
 
     def _load_ds(ids: List[str]) -> List[dict]:
@@ -674,6 +789,8 @@ def build_node_datasets(
     # 记录 build_node_datasets 的总耗时（含 _load_ds 中的元数据组织开销）
     # 注：真实网络 I/O（CSV/NIfTI 下载）已在 time_block("network_download/...") 中单独计时
     record_timing("data_prep/build_node_datasets", time.perf_counter() - _build_t0)
+    if return_split_ids:
+        return result, split_ids   # 附带角色→ds_id 分配结果（用于记录 cross 实际使用的 ds_id）
     return result   # 返回各节点的训练/测试数据集字典
 
 

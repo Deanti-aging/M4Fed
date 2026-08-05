@@ -127,6 +127,10 @@ def main():
     # 数据集准备                                                            #
     # ------------------------------------------------------------------ #
     all_ds_ids = _load_openmind_ds_ids(cfg)   # 枚举 OpenMind 子数据集 ID
+    # 各 ds_id 的 age/sex/health_status 缺失率统计，用于挑选 cross（跨站点评估）数据集时
+    # 二次把关：缺失率过高的 ds_id 会被跳过，避免偏差分析（性别/健康状态×年龄误差热图）
+    # 因样本量过少而不可靠；无法计算时（如离线虚拟 ID 调试）返回 None，退化为不做质量过滤
+    quality_stats = _load_ds_quality_stats(cfg)
     mri_shape = tuple(cfg.data.mri_shape)      # 从配置读取目标分辨率
 
     sample_loader_fn = make_openmind_sample_loader(
@@ -140,7 +144,9 @@ def main():
             task_specs[field]["n_classes"] = n
 
     # 构建 M4Fed 专用划分（服务器公开+私有 + 2 个客户端私有）
-    node_datasets = build_node_datasets(
+    # return_split_ids=True：额外拿到 assign_ds_splits 的角色→ds_id 分配结果，
+    # 用于事后报告 cross 实际用了哪些 ds_id（见下方 cross_ds_ids.csv 保存）
+    node_datasets, split_ids = build_node_datasets(
         all_ds_ids=all_ds_ids,               # 所有可用数据集 ID 列表
         n_cross=cfg.data.n_cross_ds,          # 公开数据集数量（服务器热身用）
         n_private_per_node=cfg.data.n_private_ds_per_node,  # 每个节点的私有数据集数量
@@ -149,7 +155,15 @@ def main():
         mri_shape=mri_shape,                  # MRI 目标分辨率
         seed=cfg.data.seed,                   # 划分随机种子
         sample_loader_fn=sample_loader_fn,
+        quality_stats=quality_stats,          # ds_id → {字段: 缺失率}，None 表示不过滤
+        max_missing_ratio=cfg.data.cross_max_missing_ratio,
+        return_split_ids=True,
     )
+    # cross 集合仅由 all_ds_ids/n_cross/seed/quality_stats 决定，与 n_clients 无关，
+    # 因此 3 客户端划分复用同一批 cross ds_id，无需再次报告
+    save_csv({"ds_id": split_ids["cross"]}, os.path.join(results_dir, "cross_ds_ids.csv"))
+    print(f"[数据] cross 数据集（{len(split_ids['cross'])} 个 ds_id）已记录至 "
+          f"{os.path.join(results_dir, 'cross_ds_ids.csv')}")
 
     # 构建 3 客户端划分（FedAvg/FedProx/FAN/GPT-FL 共用同一划分）
     node_datasets_3 = build_node_datasets(
@@ -161,6 +175,8 @@ def main():
         mri_shape=mri_shape,
         seed=cfg.data.seed,
         sample_loader_fn=sample_loader_fn,
+        quality_stats=quality_stats,
+        max_missing_ratio=cfg.data.cross_max_missing_ratio,
     )
 
     # ------------------------------------------------------------------ #
@@ -218,7 +234,8 @@ def main():
     # ------------------------------------------------------------------ #
     # 汇总指标并生成对比图表                                                 #
     # ------------------------------------------------------------------ #
-    _save_summary_and_figures(all_results, results_dir, cfg)   # 保存汇总 CSV 和柱状图
+    _save_summary_and_figures(all_results, results_dir, cfg)   # 保存领域指标汇总 CSV 和柱状图
+    _save_generative_summary(all_results, results_dir, cfg)    # 保存生成指标汇总 CSV 和柱状图
 
     # 保存各阶段耗时分布（用于论文效率对比和计算资源分析）
     from utils.timing_utils import save_timing_csv   # 局部导入（避免顶层循环依赖）
@@ -311,6 +328,83 @@ def _save_summary_and_figures(all_results: dict, results_dir: str, cfg) -> None:
     print("[汇总] 指标柱状图已保存至", figs_dir)
 
 
+def _save_generative_summary(all_results: dict, results_dir: str, cfg) -> None:
+    """
+    汇总 FAN / GPT-FL / M4Fed 三个方法的生成模型指标（PSNR/SSIM/LPIPS/FID/KID），
+    保存为 CSV 并为每个指标绘制带误差棒的柱状图。
+
+    处理逻辑：
+      - 从每个方法结果的 "gen" 字段读取 "clients_mean" / "clients_std"（跨客户端统计）
+      - M4Fed / GPT-FL 的服务器生成指标单独列出（标为 "<方法>-server"，std=0，因只有一个服务器）
+      - FedAvg / FedProx 无生成模型，自动跳过（结果中无 "gen" 字段）
+
+    参数：
+      all_results : {方法名: run_xxx() 的返回字典}
+      results_dir : 结果根目录
+      cfg         : 配置对象（读取 eval.figure_format 和 eval.palette）
+    """
+    from evaluation.generative_eval import GEN_METRIC_KEYS   # 生成指标名列表
+
+    fmt = cfg.eval.figure_format   # 图表格式
+    palette = cfg.eval.palette     # 调色板
+
+    # 内部方法名 → 图表展示名称
+    bname_map = {"fan": "FAN", "gptfl": "GPT-FL", "m4fed": "M4Fed-clients"}
+
+    summary_rows = []   # 汇总表格行
+    metric_means = {}   # {显示名称: {指标名: 均值}}（供柱状图）
+    metric_stds = {}    # {显示名称: {指标名: 标准差}}
+
+    for method in ["fan", "gptfl", "m4fed"]:
+        res = all_results.get(method)
+        if not res or "gen" not in res:
+            continue   # 该方法无生成模型（FedAvg/FedProx）或未运行，跳过
+        gen = res["gen"]
+        mean = gen.get("clients_mean", {})   # 跨客户端均值
+        std = gen.get("clients_std", {})      # 跨客户端标准差
+        row = {"method": method}
+        for k in GEN_METRIC_KEYS:
+            row[f"{k}_mean"] = mean.get(k, float("nan"))
+            row[f"{k}_std"] = std.get(k, float("nan"))
+        summary_rows.append(row)
+
+        label = bname_map.get(method, method)
+        metric_means[label] = {k: mean.get(k, float("nan")) for k in GEN_METRIC_KEYS}
+        metric_stds[label] = {k: std.get(k, 0) for k in GEN_METRIC_KEYS}
+
+        # 服务器生成指标单独成行（M4Fed / GPT-FL 有服务器节点；std=0 因只有一个服务器）
+        if "server" in gen:
+            sr = gen["server"]
+            srow = {"method": f"{method}-server"}
+            for k in GEN_METRIC_KEYS:
+                srow[f"{k}_mean"] = sr.get(k, float("nan"))
+                srow[f"{k}_std"] = 0
+            summary_rows.append(srow)
+            slabel = f"{bname_map.get(method, method).split('-')[0]}-server"
+            metric_means[slabel] = {k: sr.get(k, float("nan")) for k in GEN_METRIC_KEYS}
+            metric_stds[slabel] = {k: 0 for k in GEN_METRIC_KEYS}
+
+    if not summary_rows:
+        print("[汇总] 无生成模型指标可汇总（FAN/GPT-FL/M4Fed 均未产生结果）。")
+        return
+
+    summary_df = pd.DataFrame(summary_rows)   # 转为 DataFrame
+    save_csv(summary_df, os.path.join(results_dir, "summary_generative_metrics.csv"))
+    print("[汇总] 生成指标汇总表已保存。")
+
+    # 绘制各生成指标的柱状图（含误差棒）
+    figs_dir = ensure_dir(os.path.join(results_dir, "figures"))
+    for metric in GEN_METRIC_KEYS:
+        plot_metric_bars(
+            metric_means, metric_stds,
+            metric_name=metric,
+            palette=palette,
+            save_path=os.path.join(figs_dir, f"bar_gen_{metric}"),
+            fmt=fmt,
+        )
+    print("[汇总] 生成指标柱状图已保存至", figs_dir)
+
+
 def _cuda_available() -> bool:
     """
     检查 CUDA GPU 是否可用（用于自动降级到 CPU）。
@@ -356,6 +450,38 @@ def _load_openmind_ds_ids(cfg) -> list:
         # 枚举失败时回退到虚拟 ID（用于调试或网络受限环境）
         print(f"[数据] 无法从 HuggingFace 加载：{e}，使用虚拟 ID 代替。")
         return [f"ds{i:06d}" for i in range(100)]   # 返回 100 个虚拟 ID
+
+
+def _load_ds_quality_stats(cfg):
+    """
+    获取各 ds_id 的 age/sex/health_status 缺失率统计，供 cross 数据集质量筛选使用
+    （build_node_datasets 的 quality_stats 参数）。
+
+    优先级与 _load_openmind_ds_ids 保持一致，确保统计的 ds_id 集合与枚举出的
+    all_ds_ids 口径一致：
+      1. 本地 openneuro_metadata.csv → compute_ds_quality_stats
+      2. HuggingFace 元数据接口 → 复用 _load_openmind_metadata 返回的表统计
+      3. 均不可用（如虚拟 ID 调试模式）→ 返回 None，assign_ds_splits 退化为不做质量过滤
+
+    参数：
+      cfg : 配置对象（含 local_metadata_csv、hf_dataset_id、cache_dir 字段）
+
+    返回：
+      {ds_id: {field: missing_ratio}} 或 None
+    """
+    import os
+    from data.openmind_dataset import (
+        compute_ds_quality_stats, _load_openmind_metadata, _missing_ratio_by_ds_id,
+    )
+    local_csv = cfg.data.local_metadata_csv
+    if local_csv and os.path.exists(local_csv):
+        return compute_ds_quality_stats(local_csv)
+    try:
+        df = _load_openmind_metadata(cfg.data.hf_dataset_id, cfg.data.cache_dir or None, "T1w")
+        return _missing_ratio_by_ds_id(df, ("age", "sex", "health_status"))
+    except Exception as e:
+        print(f"[数据] 无法计算 cross 数据集质量统计：{e}，跳过质量过滤。")
+        return None   # assign_ds_splits 在 quality_stats=None 时行为与不传一致
 
 
 if __name__ == "__main__":

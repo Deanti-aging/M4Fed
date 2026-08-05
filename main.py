@@ -102,6 +102,7 @@ def main():
         from experiments.ablation import run_ablation
         task_specs = {
             "age":           {"type": "regression",     "n_classes": 1},
+            "sex":           {"type": "classification", "n_classes": 2},
             "health_status": {"type": "classification", "n_classes": 2},  # run_ablation 内更新 n_classes
             "race":          {"type": "classification", "n_classes": 5},  # run_ablation 内更新 n_classes
         }
@@ -112,6 +113,7 @@ def main():
         from experiments.sensitivity import run_sensitivity
         task_specs = {
             "age":           {"type": "regression",     "n_classes": 1},
+            "sex":           {"type": "classification", "n_classes": 2},
             "health_status": {"type": "classification", "n_classes": 2},  # run_sensitivity 内更新 n_classes
             "race":          {"type": "classification", "n_classes": 5},  # run_sensitivity 内更新 n_classes
         }
@@ -121,14 +123,18 @@ def main():
         # 跨站点泛化实验：在未见过的采集中心数据上评估服务器端领域模型（SwinMultiTask）
         from experiments.cross_site import run_cross_site
         from data.openmind_dataset import build_node_datasets, OpenMindDataset, make_openmind_sample_loader
+        from utils.io_utils import save_csv, ensure_dir
 
         sample_loader_fn = make_openmind_sample_loader(
             cfg.data.hf_dataset_id,                  # HuggingFace 数据集仓库 ID
             cache_dir=cfg.data.cache_dir or None,    # 本地缓存目录
             max_cache_gb=cfg.data.max_cache_gb,      # LRU 缓存容量上限（GB）
         )
+        # 各 ds_id 的 age/sex/health_status 缺失率统计，用于挑选 cross 数据集时二次把关
+        # （缺失率过高的 ds_id 会被跳过），避免偏差分析热图因样本量过少而不可靠
+        quality_stats = _load_ds_quality_stats(cfg)
         # 构建完整节点数据集（服务器 + 2 客户端 + 跨站点评估集）
-        nd = build_node_datasets(
+        nd, split_ids = build_node_datasets(
             all_ds_ids=all_ds_ids,                              # 所有数据集 ID
             n_cross=cfg.data.n_cross_ds,                         # 跨站点数据集数量
             n_private_per_node=cfg.data.n_private_ds_per_node,  # 每节点私有数据集数量
@@ -137,9 +143,19 @@ def main():
             mri_shape=mri_shape,                                 # MRI 目标分辨率
             seed=cfg.data.seed,                                  # 数据划分随机种子
             sample_loader_fn=sample_loader_fn,                   # 样本加载函数
+            quality_stats=quality_stats,                         # ds_id → {字段: 缺失率}，None 表示不过滤
+            max_missing_ratio=cfg.data.cross_max_missing_ratio,
+            return_split_ids=True,
         )
         # nd["cross"]["all"] 包含所有跨站点子数据集的样本（不分 train/test，全部用于评估）
         cross_ds = nd["cross"]["all"]
+
+        # 报告 cross 实际使用了哪些 ds_id，便于核对偏差分析的数据来源
+        cross_report_dir = ensure_dir(os.path.join(args.results_dir, "cross_site"))
+        save_csv({"ds_id": split_ids["cross"]}, os.path.join(cross_report_dir, "cross_ds_ids.csv"))
+        print(f"[main] cross 数据集（{len(split_ids['cross'])} 个 ds_id）已记录至 "
+              f"{os.path.join(cross_report_dir, 'cross_ds_ids.csv')}")
+
         model_path = os.path.join(args.results_dir, "m4fed", "server_swin.pt")
         run_cross_site(args, cfg, cross_ds, args.results_dir, model_path)
 
@@ -185,6 +201,28 @@ def _load_ds_ids(cfg) -> list:
         # 任何异常（网络错误、未安装 huggingface_hub 等）都退回虚拟 ID
         print(f"[main] HuggingFace 加载失败: {e}。改用虚拟 ID。")
         return [f"ds{i:06d}" for i in range(100)]   # 100 个虚拟 ID
+
+
+def _load_ds_quality_stats(cfg):
+    """
+    获取各 ds_id 的 age/sex/health_status 缺失率统计，供 cross 数据集质量筛选使用
+    （build_node_datasets 的 quality_stats 参数）。优先级与 _load_ds_ids 一致，
+    保证统计的 ds_id 集合与 all_ds_ids 口径对齐。
+
+    返回：
+      {ds_id: {field: missing_ratio}} 或 None（无法计算时，退化为不做质量过滤）
+    """
+    local_csv = cfg.data.local_metadata_csv
+    if local_csv and os.path.exists(local_csv):
+        from data.openmind_dataset import compute_ds_quality_stats
+        return compute_ds_quality_stats(local_csv)
+    try:
+        from data.openmind_dataset import _load_openmind_metadata, _missing_ratio_by_ds_id
+        df = _load_openmind_metadata(cfg.data.hf_dataset_id, cfg.data.cache_dir or None, "T1w")
+        return _missing_ratio_by_ds_id(df, ("age", "sex", "health_status"))
+    except Exception as e:
+        print(f"[main] 无法计算 cross 数据集质量统计: {e}，跳过质量过滤。")
+        return None
 
 
 if __name__ == "__main__":

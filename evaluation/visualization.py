@@ -68,7 +68,6 @@ def save_figure(fig: plt.Figure, path: str, fmt: str = "svg", dpi: int = 300) ->
 
 def plot_loss_curves(
     losses: Dict[str, Dict[str, list]],   # {基线名: {'mean': [损失值...], 'std': [标准差...]}}
-    title: str = "Training Loss",          # 图表标题
     xlabel: str = "Round",                 # x 轴标签
     ylabel: str = "Loss",                  # y 轴标签
     palette: Optional[List[str]] = None,   # 颜色列表（默认用 PALETTE）
@@ -107,7 +106,6 @@ def plot_loss_curves(
     # 设置图例（右上角，半透明背景）
     ax.legend(handles=handles, loc="upper right", bbox_to_anchor=(1.0, 1.0),
               framealpha=0.85, fontsize=9)
-    ax.set_title(title, fontsize=13)     # 图表标题
     ax.set_xlabel(xlabel, fontsize=11)   # x 轴标签
     ax.set_ylabel(ylabel, fontsize=11)   # y 轴标签
     ax.grid(True, alpha=0.3)             # 网格线（轻微透明）
@@ -125,7 +123,6 @@ def plot_metric_bars(
     metrics: Dict[str, Dict[str, float]],              # {基线名: {指标名: 值}}
     stds: Optional[Dict[str, Dict[str, float]]] = None,  # 误差棒（标准差，可选）
     metric_name: str = "MAE",               # 要展示的指标名称
-    title: Optional[str] = None,            # 图表标题（默认自动生成）
     palette: Optional[List[str]] = None,    # 颜色列表
     save_path: Optional[str] = None,        # 保存路径
     fmt: str = "svg",                       # 保存格式
@@ -158,7 +155,6 @@ def plot_metric_bars(
     ax.set_xticks(x)   # 设置 x 轴刻度位置
     ax.set_xticklabels(bnames, rotation=20, ha="right", fontsize=9)   # x 轴标签（旋转防重叠）
     ax.set_ylabel(metric_name, fontsize=11)   # y 轴标签（指标名）
-    ax.set_title(title or f"{metric_name} 对比", fontsize=13)   # 图表标题
     ax.grid(axis="y", alpha=0.3)   # 水平网格线（辅助读数）
     handles = [mpatches.Patch(color=c, label=n) for c, n in zip(colors, bnames)]   # 图例句柄
     ax.legend(handles=handles, loc="upper right", bbox_to_anchor=(1.0, 1.0),
@@ -176,7 +172,6 @@ def plot_metric_bars(
 def plot_scatter(
     y_true: List[float],           # 真实年龄列表
     y_pred: List[float],           # 预测年龄列表
-    title: str = "True Age vs Predicted Age",  # 图表标题
     save_path: Optional[str] = None,   # 保存路径
     fmt: str = "svg",                  # 保存格式
 ) -> plt.Figure:
@@ -200,7 +195,6 @@ def plot_scatter(
     ax.plot([lo, hi], [lo, hi], "k--", linewidth=1.5, label="y=x")   # 理想对角线（y=x）
     ax.set_xlabel("True Age", fontsize=11)       # x 轴：真实年龄
     ax.set_ylabel("Predicted Age", fontsize=11)  # y 轴：预测年龄
-    ax.set_title(title, fontsize=13)             # 图表标题
     ax.legend(fontsize=9)    # 显示图例（y=x 参考线说明）
     ax.grid(True, alpha=0.3)   # 网格线
     fig.tight_layout()   # 调整间距
@@ -213,7 +207,6 @@ def plot_age_bin_mae(
     bins: List[str],                    # 年龄段标签列表（如 ["20-30", "30-40", ...]）
     mae: List[float],                   # 各年龄段的 MAE 列表
     std: Optional[List[float]] = None,  # 各年龄段的 MAE 标准差（用于误差棒，可选）
-    title: str = "Age-bin MAE",         # 图表标题
     save_path: Optional[str] = None,    # 保存路径
     fmt: str = "svg",                   # 保存格式
 ) -> plt.Figure:
@@ -238,7 +231,6 @@ def plot_age_bin_mae(
     ax.set_xticks(x)   # 设置 x 轴刻度
     ax.set_xticklabels(bins, rotation=30, ha="right", fontsize=9)   # x 轴年龄段标签
     ax.set_ylabel("MAE (years)", fontsize=11)   # y 轴：MAE（年）
-    ax.set_title(title, fontsize=13)             # 图表标题
     ax.grid(axis="y", alpha=0.3)                 # 水平网格线
     fig.tight_layout()   # 调整间距
     if save_path:
@@ -249,7 +241,6 @@ def plot_age_bin_mae(
 def plot_residuals(
     ages: List[float],                # 真实年龄列表（x 轴）
     errors: List[float],              # 带符号预测误差列表（y 轴，预测 - 真实）
-    title: str = "Residual Plot",     # 图表标题
     save_path: Optional[str] = None,  # 保存路径
     fmt: str = "svg",                 # 保存格式
 ) -> plt.Figure:
@@ -274,7 +265,6 @@ def plot_residuals(
     ax.axhline(0, color="k", linewidth=1.5, linestyle="--")   # y=0 参考线（理想残差基准）
     ax.set_xlabel("True Age", fontsize=11)                           # x 轴：真实年龄
     ax.set_ylabel("Prediction Error (Pred - True)", fontsize=11)     # y 轴：预测误差
-    ax.set_title(title, fontsize=13)   # 图表标题
     ax.grid(True, alpha=0.3)           # 网格线
     fig.tight_layout()   # 调整间距
     if save_path:
@@ -286,7 +276,6 @@ def plot_error_heatmap(
     pivot: pd.DataFrame,                        # 透视表（行=年龄段，列=因子取值，值=平均绝对误差）
     xlabel: str = "Category",                   # x 轴标签（因子类别名称）
     ylabel: str = "Age bin",                    # y 轴标签
-    title: str = "Error Heatmap",               # 图表标题
     save_path: Optional[str] = None,            # 保存路径
     fmt: str = "svg",                           # 保存格式
 ) -> plt.Figure:
@@ -314,7 +303,6 @@ def plot_error_heatmap(
                 linewidths=0.5, cbar_kws={"label": "MAE (years)"})
     ax.set_xlabel(xlabel, fontsize=11)   # x 轴标签
     ax.set_ylabel(ylabel, fontsize=11)   # y 轴标签
-    ax.set_title(title, fontsize=13)     # 图表标题
     fig.tight_layout()   # 调整间距
     if save_path:
         save_figure(fig, save_path, fmt=fmt)   # 保存图表
@@ -354,30 +342,25 @@ def save_all_bias_figures(
 
     # 散点图：真实年龄 vs 预测年龄
     plot_scatter(d["scatter"]["y_true"], d["scatter"]["y_pred"],
-                 title=f"True vs Predicted Age ({method_name})",
                  save_path=os.path.join(out_dir, f"{method_name}_scatter"), fmt=fmt)
 
     # 年龄分段 MAE 柱状图
     plot_age_bin_mae(d["age_bin_mae"]["bins"], d["age_bin_mae"]["mae"],
                      std=d["age_bin_mae"].get("std"),     # 标准差（可选）
-                     title=f"Age-bin MAE ({method_name})",
                      save_path=os.path.join(out_dir, f"{method_name}_age_bin_mae"), fmt=fmt)
 
     # 残差图：真实年龄 vs 预测误差
     plot_residuals(d["residuals"]["age"], d["residuals"]["error"],
-                   title=f"Residuals ({method_name})",
                    save_path=os.path.join(out_dir, f"{method_name}_residuals"), fmt=fmt)
 
     # 性别×年龄误差热图（若 sex_heatmap 非 None）
     if d.get("sex_heatmap") is not None:
         plot_error_heatmap(d["sex_heatmap"],
                            xlabel="Sex", ylabel="Age Bin",
-                           title=f"Age×Sex Error Heatmap ({method_name})",
                            save_path=os.path.join(out_dir, f"{method_name}_sex_heatmap"), fmt=fmt)
 
     # 健康状态×年龄误差热图（若 health_heatmap 非 None）
     if d.get("health_heatmap") is not None:
         plot_error_heatmap(d["health_heatmap"],
                            xlabel="Health Status", ylabel="Age Bin",
-                           title=f"Age×Health Error Heatmap ({method_name})",
                            save_path=os.path.join(out_dir, f"{method_name}_health_heatmap"), fmt=fmt)

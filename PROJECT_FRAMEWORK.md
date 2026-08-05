@@ -194,8 +194,7 @@ python=3.10
 pytorch>=2.1 torchvision torchaudio pytorch-cuda=12.1
 
 # Medical imaging
-monai[all]>=1.3
-monai-generative>=0.2   # or install from source
+monai>=1.4              # DiffusionModelUNet/AutoencoderKL 已合并进核心包，无需再装 monai-generative
 
 # HuggingFace ecosystem
 transformers>=4.40      # NeuroFM 加载（AutoModel）
@@ -355,6 +354,7 @@ einops>=0.7
 
 #### evaluation/
 - **metrics.py**：`compute_domain_metrics`（scipy/sklearn）；`compute_image_metrics`（skimage PSNR/SSIM + lpips 中间切片）；`compute_fid_kid`（torch-fidelity，保存临时 PNG）；`compute_bias_analysis`（age-bin MAE、残差、性别/健康状态 pivot heatmap）。
+- **generative_eval.py**：`evaluate_generative_model`（对某节点 MedMD 以 img2img 从真实测试体积配对合成，计算 PSNR/SSIM/LPIPS/FID/KID，样本数与噪声强度由 `EvalConfig.gen_eval_max_samples`/`gen_eval_noise_strength` 控制）；`aggregate_metrics`（跨节点 mean/std）；`save_summary`/`save_loss_summary`（跨节点 mean/std 汇总 CSV）。生成模型评估已接入 FAN（各 client）、GPT-FL（server 生成模型 vs server+各 client 数据）、M4Fed（server+各 client）三个方法的评估阶段；FedAvg/FedProx 无生成模型。
 - **visualization.py**：所有图均使用 Carlito 字体（自动 fallback）+ 6色 palette；`plot_loss_curves`（阴影区间表示 std）；`plot_metric_bars`（误差棒）；5种偏差分析图；`save_figure`（svg/pdf）。
 
 #### experiments/
@@ -372,7 +372,7 @@ einops>=0.7
 
 | 类别 | 说明 |
 |------|------|
-| 依赖安装 | 需先按 `requirements.txt` 建立 conda/pip 环境；MONAI GenerativeModels 需从源码安装（`pip install git+https://github.com/Project-MONAI/GenerativeModels.git`）；BioMedCLIP 需要 `open-clip-torch`（`pip install open-clip-torch`），不能单独依赖 `transformers` 加载 |
+| 依赖安装 | 需先按 `requirements.txt` 建立 conda/pip 环境；`DiffusionModelUNet`/`AutoencoderKL` 已随 `monai>=1.4.0` 核心包安装，无需再单独装 monai-generative/GenerativeModels；BioMedCLIP 需要 `open-clip-torch`（`pip install open-clip-torch`），不能单独依赖 `transformers` 加载 |
 | SwinUNETR 加载 | 预训练权重通过 `torch.hub.load_state_dict_from_url` 下载，需要网络；下载失败时自动退回 `_Backbone3DCNN`；`feature_size` 须与 checkpoint 一致（默认 48） |
 | VAE 权重 | `katielink` 收藏中的具体 repo 名需确认；目前 `vae_repo` 默认值为占位符，实际使用需更新 `configs/m4fed.yaml` 中的 `vae_repo` 字段 |
 | HuggingFace 真实数据接入 | `AnonRes/OpenMind` 是按 `dsXXXXXX/` 文件夹组织的原始 NIfTI 文件仓库（114k 文件，800 个子数据集），配一份 38MB 的 `openneuro_metadata.csv`（列：`unique_id, modality, image_quality_score, age, weight, bmi, sex, handedness, race, health_status, manufacturer, model_name, phase_encoding_direction, magnetic_field_strength, repetition_time, echo_time, is_brain_extract, derived_from, image_path, anat_mask_path, anon_mask_path`），没有 `train` split 也没有 `dataset_id`/`ds_id` 字段。已改为：`list_openmind_ds_ids()` 枚举仓库文件路径前缀得到 ds_id；`make_openmind_sample_loader()` 下载/解析 CSV、按 `modality=="T1w"` 筛选（42.7k/114k 行）并按 ds_id 分组，返回的 `sample_loader_fn` 已接入 `main.py`/`run_all_baselines.py`/`ablation.py`/`sensitivity.py`/`cross_site.py` 的所有 `build_node_datasets` 调用；NIfTI 文件本身在 `OpenMindDataset.__getitem__` 中惰性下载（`_resolve_hf_path`，命中 huggingface_hub 本地缓存） |

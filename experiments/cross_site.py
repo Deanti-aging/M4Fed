@@ -67,6 +67,7 @@ def run_cross_site(args, cfg, cross_dataset: OpenMindDataset, results_dir: str,
     # ------------------------------------------------------------------
     task_specs = {
         "age":           {"type": "regression",     "n_classes": 1},
+        "sex":           {"type": "classification", "n_classes": 2},
         "health_status": {"type": "classification", "n_classes": 2},
         "race":          {"type": "classification", "n_classes": 5},
     }
@@ -166,9 +167,16 @@ if __name__ == "__main__":
 
     from data.openmind_dataset import (build_node_datasets,
                                        list_openmind_ds_ids,
-                                       make_openmind_sample_loader)
+                                       make_openmind_sample_loader,
+                                       compute_ds_quality_stats)
     # 枚举 HuggingFace 上所有子数据集 ID（如 ds000001、ds000002 ...）
     all_ds_ids = list_openmind_ds_ids(cfg.data.hf_dataset_id)
+    # 各 ds_id 的 age/sex/health_status 缺失率统计，用于挑选 cross 数据集时二次把关
+    # （缺失率过高的 ds_id 会被跳过），避免偏差分析热图因样本量过少而不可靠；
+    # 仅在能读取本地 local_metadata_csv 时可用，否则跳过质量过滤（None）
+    quality_stats = None
+    if cfg.data.local_metadata_csv and os.path.exists(cfg.data.local_metadata_csv):
+        quality_stats = compute_ds_quality_stats(cfg.data.local_metadata_csv)
     # 创建样本加载函数（从 HuggingFace 惰性下载 NIfTI + CSV 元数据）
     sample_loader_fn = make_openmind_sample_loader(
         cfg.data.hf_dataset_id,                  # HuggingFace 仓库 ID
@@ -176,7 +184,7 @@ if __name__ == "__main__":
         max_cache_gb=cfg.data.max_cache_gb,      # LRU 磁盘缓存上限（GB）
     )
     # 构建完整节点数据集（包含 cross 子集）
-    nd = build_node_datasets(
+    nd, split_ids = build_node_datasets(
         all_ds_ids,                              # 所有子数据集 ID
         cfg.data.n_cross_ds,                     # 划分给跨站点的数据集数量
         cfg.data.n_private_ds_per_node,          # 每节点私有数据集数量
@@ -185,8 +193,18 @@ if __name__ == "__main__":
         mri_shape,                               # MRI 目标分辨率
         cfg.data.seed,                           # 随机种子
         sample_loader_fn=sample_loader_fn,       # 真实数据加载函数
+        quality_stats=quality_stats,             # ds_id → {字段: 缺失率}，None 表示不过滤
+        max_missing_ratio=cfg.data.cross_max_missing_ratio,
+        return_split_ids=True,
     )
     cross_samples = nd["cross"]["all"].samples   # 取出跨站点评估集的样本列表
+
+    # 报告 cross 实际使用了哪些 ds_id，便于核对偏差分析的数据来源
+    from utils.io_utils import save_csv, ensure_dir
+    cross_report_dir = ensure_dir(os.path.join(args.results_dir, "cross_site"))
+    save_csv({"ds_id": split_ids["cross"]}, os.path.join(cross_report_dir, "cross_ds_ids.csv"))
+    print(f"[Cross-site] cross 数据集（{len(split_ids['cross'])} 个 ds_id）已记录至 "
+          f"{os.path.join(cross_report_dir, 'cross_ds_ids.csv')}")
 
     # 构建跨站点 OpenMindDataset（不做数据增强）
     cross_ds = OpenMindDataset(cross_samples, mri_shape)

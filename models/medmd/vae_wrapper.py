@@ -6,8 +6,8 @@
   - 权重文件：models/model_autoencoder.pt（约 84 MB）
 
 加载优先级：
-  1. 尝试从 MONAI GenerativeModels 加载 AutoencoderKL，并从 HuggingFace 下载预训练权重
-  2. 若 MONAI 不可用，退回极简的 _MinimalVAE（仅用于单元测试，不具备真实编解码质量）
+  1. 尝试从 monai.networks.nets 加载 AutoencoderKL（monai>=1.4.0 核心包自带），并从 HuggingFace 下载预训练权重
+  2. 若 monai 版本过低/不可用，退回极简的 _MinimalVAE（仅用于单元测试，不具备真实编解码质量）
 
 加载完成后冻结所有参数（VAE 在 M4Fed 中始终保持固定，不参与训练）。
 """
@@ -44,9 +44,9 @@ def load_vae(
     返回：
       冻结的 VAE 模型（eval 模式，所有参数 requires_grad=False）
     """
-    # 尝试加载 MONAI GenerativeModels 中的 AutoencoderKL（需要安装 monai-generative 包）
+    # 尝试加载 monai 核心包中的 AutoencoderKL（monai>=1.4.0 自带，原独立的 monai-generative 已合并进来）
     try:
-        from generative.networks.nets import AutoencoderKL  # MONAI 生成模型库
+        from monai.networks.nets import AutoencoderKL
         # 架构参数与 MONAI/brats_mri_generative_diffusion 的 train_autoencoder.json 完全对齐
         # 该 VAE 关闭了所有注意力机制（空间注意力 + 编码/解码器非局部注意力），目的是与 MONAI/brats_mri_generative_diffusion 预训练权重的配置保持一致。
         vae = AutoencoderKL(
@@ -78,8 +78,8 @@ def load_vae(
                 # 下载失败（无网络/文件缺失等），继续使用随机初始化（训练前应手动下载）
                 print(f"[VAE] 无法加载预训练权重: {e}。使用随机初始化。")
     except ImportError:
-        # MONAI GenerativeModels 未安装，退回极简 VAE（不具备真实编解码质量）
-        print("[VAE] MONAI GenerativeModels 未找到。使用 MinimalVAE 替代。")
+        # monai 版本过低（<1.4.0）或未安装，退回极简 VAE（不具备真实编解码质量）
+        print("[VAE] monai.networks.nets.AutoencoderKL 不可用。使用 MinimalVAE 替代。")
         vae = _MinimalVAE(in_channels, latent_channels)  # 创建极简 VAE 实例
 
     # 冻结所有参数：VAE 在整个训练过程中保持固定（不参与反向传播）

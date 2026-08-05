@@ -272,6 +272,7 @@ if __name__ == "__main__":
     mri_shape = tuple(cfg.data.mri_shape)
     task_specs = {
         "age":           {"type": "regression",     "n_classes": 1},
+        "sex":           {"type": "classification", "n_classes": 2},
         "health_status": {"type": "classification", "n_classes": 2},
         "race":          {"type": "classification", "n_classes": 5},
     }

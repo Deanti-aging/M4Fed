@@ -5,6 +5,14 @@ from .metrics import (
     compute_fid_kid,          # 计算 FID / KID（基于 torch-fidelity，评估合成分布质量）
     compute_bias_analysis,    # 按年龄段/性别分组计算误差（偏差分析，用于公平性评估）
 )
+from .generative_eval import (
+    evaluate_generative_model,   # 评估单个 MedMD 生成模型：PSNR/SSIM/LPIPS/FID/KID
+    nan_generative_metrics,      # 全 NaN 生成指标占位（无数据/合成失败时）
+    aggregate_metrics,           # 跨节点指标聚合（mean/std，忽略 NaN）
+    save_summary,                # 保存跨节点 mean/std 指标为 CSV
+    save_loss_summary,           # 保存跨客户端逐轮损失 mean/std 为 CSV
+    GEN_METRIC_KEYS,             # 生成指标名列表
+)
 from .visualization import (
     plot_loss_curves,         # 绘制各方法训练损失曲线（含 ±1 std 阴影区域）
     plot_metric_bars,         # 绘制各方法指标对比柱状图（含误差棒）
@@ -19,6 +27,9 @@ from .visualization import (
 __all__ = [
     "compute_domain_metrics", "compute_image_metrics",
     "compute_fid_kid", "compute_bias_analysis",
+    "evaluate_generative_model", "nan_generative_metrics",
+    "aggregate_metrics", "save_summary", "save_loss_summary",
+    "GEN_METRIC_KEYS",
     "plot_loss_curves", "plot_metric_bars",
     "plot_scatter", "plot_age_bin_mae", "plot_residuals",
     "plot_error_heatmap", "save_figure",

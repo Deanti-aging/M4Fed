@@ -31,14 +31,62 @@ from training.swin_trainer import SwinTrainer                # SwinMultiTask 预
 from evaluation.metrics import (                            # 评估指标函数
     compute_domain_metrics, compute_image_metrics, compute_bias_analysis
 )
+from evaluation.generative_eval import (                    # 生成模型评估与汇总工具
+    evaluate_generative_model, aggregate_metrics, save_summary, save_loss_summary,
+)
 from evaluation.visualization import save_all_bias_figures  # 偏差分析可视化保存工具
-from data.openmind_dataset import OpenMindDataset, make_dataloader  # 数据集和 DataLoader 工厂
+from data.openmind_dataset import OpenMindDataset, make_dataloader, _PATIENT_FIELDS  # 数据集和 DataLoader 工厂
+from data.table_to_text import table_row_to_text             # 元数据行 → 自然语言条件文本
 from utils.io_utils import save_csv, save_model, ensure_dir  # 文件保存工具
 from utils.timing_utils import record_timing                # 计时记录工具
 
 import os                              # 标准库：路径拼接
 import time                            # 标准库：高精度时间戳
 import pandas as pd                    # Pandas：损失和指标的 CSV 保存
+
+
+def _impute_node_metadata(samples: list, imputer: TabPFNImputer, protected_fields: set) -> None:
+    """
+    对一组样本的元数据做 TabPFN 表格补全，原地更新每个样本的 'metadata' 和 'table_text'。
+
+    填充值的使用范围按用途区分（关键设计）：
+      - table_text（生成模型 MedMD 的文本条件，热身/联邦循环阶段训练/合成时使用）：
+        _PATIENT_FIELDS 全部列（含 protected_fields，即 age/sex/health_status/race）
+        都参与填充，尽可能让条件文本完整，提升多模态生成质量。
+      - metadata（本地训练阶段 SwinMultiTask 领域模型的标签来源，
+        见 SwinTrainer._build_targets 直接从 batch["metadata"] 取值）：
+        protected_fields 永远保持原始真值（缺失则仍为 NaN，训练时被 NaN mask 跳过）。
+        绝不能写入填充值，否则等于用填充器的预测冒充监督标签去训练分类/回归头。
+
+    因此同一行元数据会产生两个版本：写回 metadata 的"标签保真版"（仅补非标签字段）
+    和仅用于生成 table_text 的"完整补全版"（标签字段也参与填充，但不落盘到 metadata）。
+
+    参数：
+      samples          : 样本字典列表（如 dataset.samples，函数会原地修改）
+      imputer          : 共享的 TabPFNImputer 实例（跨节点复用，避免重复加载模型）
+      protected_fields : 当前 task_specs 的键（领域模型的预测标签字段）
+    """
+    if not samples:
+        return   # 空数据集（如该节点未分配到子数据集）无需处理
+
+    meta_df = pd.DataFrame([s["metadata"] for s in samples]).reset_index(drop=True)
+    imputable_cols = [c for c in _PATIENT_FIELDS if c in meta_df.columns]
+    if not imputable_cols:
+        return   # 元数据中没有可识别的人口学字段
+
+    # 对全部人口学字段（含标签字段）做一次填充，得到仅用于生成文本条件的"完整补全版"
+    filled = imputer.fit_transform(meta_df[imputable_cols])
+    text_df = meta_df.copy()
+    text_df[imputable_cols] = filled[imputable_cols]
+
+    # 写回 metadata 时只更新非标签字段，标签字段（protected_fields）保持原始真值不变
+    writable_cols = [c for c in imputable_cols if c not in protected_fields]
+    if writable_cols:
+        meta_df[writable_cols] = filled[writable_cols]
+
+    for i, s in enumerate(samples):
+        s["metadata"] = meta_df.iloc[i]                                        # 标签保真版（供领域模型训练）
+        s["table_text"] = table_row_to_text(text_df.iloc[i].reindex(_PATIENT_FIELDS))  # 完整补全版（供生成模型条件）
 
 
 def run_m4fed(
@@ -79,10 +127,21 @@ def run_m4fed(
     print("[M4Fed] === 阶段 1：热身 ===")
 
     # 步骤 1a：TabPFN 表格补全
-    # 填充各节点元数据中的缺失字段（如年龄、性别、诊断等），提升文本条件质量
-    # 实际中需对各节点的元数据 DataFrame 逐列运行 TabPFN；此处记录占位（已模拟）
+    # 填充各节点元数据中缺失的人口学字段，提升文本条件质量：
+    #   - 生成模型（MedMD）的文本条件：允许使用 age/sex/health_status/race 等
+    #     标签字段的填充值，热身预训练和联邦循环阶段合成/微调时都会用到更完整的条件文本
+    #   - 领域模型（SwinMultiTask）的监督标签：本地训练阶段直接从 metadata 取真值，
+    #     绝不能是填充值，否则等于用伪造标签训练分类/回归头（详见 _impute_node_metadata）
     imputer = TabPFNImputer(device=device, seed=cfg.training.seed)   # 初始化 TabPFN 填充器
-    print("[M4Fed] 热身：TabPFN 表格补全完成（已模拟）。")  # 实际运行时在此处调用 imputer.fit_transform
+    protected_fields = set(task_specs.keys())   # 领域模型的预测标签字段，metadata 中必须保持原始真值
+    node_sample_lists = [
+        server.private_datasets["train"].samples,
+        server.private_datasets["test"].samples,
+        server.public_datasets["train"].samples,
+    ] + [ds.samples for c in clients for ds in c.private_datasets.values()]
+    for samples in node_sample_lists:
+        _impute_node_metadata(samples, imputer, protected_fields)
+    print("[M4Fed] 热身：TabPFN 表格补全完成。")
 
     # 步骤 1b：服务器在公开数据上预训练 MedMD（warm_rounds 轮）
     # 公开数据分布广，有助于 U-Net 学习通用的去噪方向
@@ -97,7 +156,7 @@ def run_m4fed(
     for r in range(cfg.federated.warm_rounds):
         # 在公开训练数据上训练 1 epoch，返回该 epoch 的平均损失
         loss = server_medmd_trainer.train_epoch(server.public_train_loader)
-        warmup_losses.append({"round": r, "loss": loss, "node": "server"})   # 记录轮次和损失
+        warmup_losses.append({"phase": "warmup", "round": r, "loss": loss, "node": "server"})   # 记录阶段、轮次和损失
         print(f"  [热身] 第 {r+1}/{cfg.federated.warm_rounds} 轮  损失={loss:.4f}")
 
     # 步骤 1c：服务器将预训练好的 U-Net 权重广播给所有客户端
@@ -153,7 +212,7 @@ def run_m4fed(
         s_trainer = MedMDTrainer(server.medmd, device=device, lr=cfg.training.lr_medmd,
                                  mixed_precision=cfg.training.mixed_precision, use_qlora=False)
         s_loss = s_trainer.train_epoch(syn_loader)   # 服务器在合成数据上训练 1 epoch
-        fed_losses["server"].append({"round": fed_round, "loss": s_loss})   # 记录服务器损失
+        fed_losses["server"].append({"phase": "federated", "round": fed_round, "loss": s_loss})   # 记录服务器损失
 
         # 步骤 2c：服务器从自身私有数据生成合成数据，"发送"给所有客户端
         # 使客户端 MedMD 适应服务器节点的数据分布（反向知识传递）
@@ -183,7 +242,7 @@ def run_m4fed(
                 batch_size=cfg.training.batch_size, shuffle=True,
             )
             c_loss = c_trainer.train_epoch(c_loader)   # QLoRA 微调 1 epoch
-            fed_losses[f"client_{c.client_id}"].append({"round": fed_round, "loss": c_loss})
+            fed_losses[f"client_{c.client_id}"].append({"phase": "federated", "round": fed_round, "loss": c_loss})
 
     # ================================================================ #
     # 阶段 3：本地训练阶段（Local Training Phase）                        #
@@ -239,7 +298,7 @@ def run_m4fed(
     )
     for ep in range(cfg.federated.local_rounds):
         loss = s_nfm_trainer.train_epoch(server_local_loader)
-        local_losses["server"].append({"round": ep, "loss": loss})
+        local_losses["server"].append({"phase": "local", "round": ep, "loss": loss})
 
     # ---- 各客户端本地训练：合成样本与私有数据混合，QLoRA 微调 SwinMultiTask ----
     for c in clients:
@@ -256,7 +315,7 @@ def run_m4fed(
         )
         for ep in range(cfg.federated.local_rounds):
             loss = c_nfm_trainer.train_epoch(c_local_loader)
-            local_losses[f"client_{c.client_id}"].append({"round": ep, "loss": loss})
+            local_losses[f"client_{c.client_id}"].append({"phase": "local", "round": ep, "loss": loss})
 
     record_timing(f"{method}/train", time.perf_counter() - _train_t0)   # 记录训练总耗时
 
@@ -290,30 +349,71 @@ def run_m4fed(
     results["clients_mean"] = agg["mean"]   # 跨客户端均值
     results["clients_std"] = agg["std"]     # 跨客户端标准差
 
+    # ---- 生成模型评估（服务器 + 各客户端 MedMD：PSNR / SSIM / LPIPS / FID / KID） ----
+    # M4Fed 中服务器和每个客户端都持有各自训练好的 MedMD，逐节点用其本地测试数据评估
+    _gen_t0 = time.perf_counter()
+    gen_results = {}
+    gen_results["server"] = evaluate_generative_model(
+        server.medmd, server.test_loader, cfg, device)
+    for c in clients:
+        gen_results[f"client_{c.client_id}"] = evaluate_generative_model(
+            c.medmd, c.test_loader, cfg, device)
+    gen_agg = aggregate_metrics({k: gen_results[k] for k in client_keys})
+    gen_results["clients_mean"] = gen_agg["mean"]   # 跨客户端均值
+    gen_results["clients_std"] = gen_agg["std"]     # 跨客户端标准差
+    results["gen"] = gen_results
+    record_timing(f"{method}/gen_eval", time.perf_counter() - _gen_t0)
+
     # ================================================================ #
     # 保存结果到磁盘                                                       #
     # ================================================================ #
-    # 服务器：热身损失 + 联邦循环损失 + 本地训练损失（合并为完整训练曲线）
-    _save_losses(warmup_losses + fed_losses.get("server", []) + local_losses.get("server", []),
-                 os.path.join(out, "server_losses.csv"))
-    # 各客户端：联邦循环损失 + 本地训练损失
+    # 服务器：热身、联邦循环、本地训练三阶段各自的 round 计数独立从 0 开始，
+    # 若合并到同一份 CSV 会导致 round 列跨阶段重复、无法区分，因此按阶段分文件保存
+    _save_losses(warmup_losses, os.path.join(out, "server_warmup_losses.csv"))
+    _save_losses(fed_losses.get("server", []), os.path.join(out, "server_federated_losses.csv"))
+    _save_losses(local_losses.get("server", []), os.path.join(out, "server_local_losses.csv"))
+    # 各客户端：联邦循环损失、本地训练损失分开保存
     for c in clients:
         key = f"client_{c.client_id}"
-        all_c_loss = fed_losses.get(key, []) + local_losses.get(key, [])   # 合并两阶段损失
-        _save_losses(all_c_loss, os.path.join(out, f"{key}_losses.csv"))
+        _save_losses(fed_losses.get(key, []), os.path.join(out, f"{key}_federated_losses.csv"))
+        _save_losses(local_losses.get(key, []), os.path.join(out, f"{key}_local_losses.csv"))
 
-    # 保存评估指标 CSV（每个节点独立保存）
+    # 保存领域评估指标 CSV（每个节点独立保存）
     save_csv(pd.DataFrame([results["server"]]), os.path.join(out, "server_metrics.csv"))
     for c in clients:
         key = f"client_{c.client_id}"
         save_csv(pd.DataFrame([results[key]]), os.path.join(out, f"{key}_metrics.csv"))
 
-    # 保存模型权重（若配置要求）
+    # 保存生成评估指标 CSV（服务器 + 每个客户端）
+    save_csv(pd.DataFrame([gen_results["server"]]), os.path.join(out, "server_gen_metrics.csv"))
+    for c in clients:
+        key = f"client_{c.client_id}"
+        save_csv(pd.DataFrame([gen_results[key]]), os.path.join(out, f"{key}_gen_metrics.csv"))
+
+    # 跨客户端汇总 CSV：领域指标、生成指标、逐轮损失的 mean/std
+    save_summary(results["clients_mean"], results["clients_std"],
+                 os.path.join(out, "clients_domain_summary.csv"))
+    save_summary(gen_results["clients_mean"], gen_results["clients_std"],
+                 os.path.join(out, "clients_gen_summary.csv"))
+    # 联邦循环、本地训练两个阶段的 round 计数各自独立从 0 开始，汇总时同样分开存，
+    # 避免两阶段的 round 位置被错误对齐合并（与上面按阶段分文件保存的原则一致）
+    save_loss_summary(
+        {f"client_{c.client_id}": fed_losses.get(f"client_{c.client_id}", []) for c in clients},
+        os.path.join(out, "clients_federated_loss_summary.csv"),
+    )
+    save_loss_summary(
+        {f"client_{c.client_id}": local_losses.get(f"client_{c.client_id}", []) for c in clients},
+        os.path.join(out, "clients_local_loss_summary.csv"),
+    )
+
+    # 保存模型权重（若配置要求）：领域模型 + 生成模型，服务器与全部客户端
     if cfg.eval.save_model:
-        save_model(server.swin, os.path.join(out, "server_swin.pt"))
-        save_model(server.medmd, os.path.join(out, "server_medmd.pt"))
+        save_model(server.swin, os.path.join(out, "server_swin.pt"))     # 服务器领域模型
+        save_model(server.medmd, os.path.join(out, "server_medmd.pt"))   # 服务器生成模型
         for c in clients:
-            save_model(c.swin, os.path.join(out, f"client_{c.client_id}_swin.pt"))
+            key = f"client_{c.client_id}"
+            save_model(c.swin, os.path.join(out, f"{key}_swin.pt"))       # 客户端领域模型
+            save_model(c.medmd, os.path.join(out, f"{key}_medmd.pt"))     # 客户端生成模型
 
     return results   # 返回完整结果字典
 

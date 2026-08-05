@@ -166,7 +166,7 @@ class DDIMScheduler:
 
 class _SimpleUNet3D(nn.Module):
     """
-    极简 3D U-Net，仅用于 MONAI GenerativeModels 不可用时的冒烟测试。
+    极简 3D U-Net，仅用于 monai.networks.nets.DiffusionModelUNet 不可用时的冒烟测试。
 
     结构：编码器（单卷积层）→ 中间层 → 解码器（单卷积层）
     时间步嵌入和文本条件通过加法方式注入（通道偏置），非标准但够用于测试。
@@ -243,7 +243,7 @@ def _build_monai_unet(cfg) -> nn.Module:
       MONAI DiffusionModelUNet 或 _SimpleUNet3D 实例
     """
     try:
-        from generative.networks.nets import DiffusionModelUNet   # MONAI 生成模型库
+        from monai.networks.nets import DiffusionModelUNet   # monai>=1.4.0 核心包自带（原独立的 monai-generative 已合并进来）
         unet = DiffusionModelUNet(
             spatial_dims=cfg.unet_spatial_dims,          # 3D 空间（处理体积数据）
             in_channels=cfg.unet_in_channels,             # 输入通道数 = VAE latent_channels
@@ -257,7 +257,7 @@ def _build_monai_unet(cfg) -> nn.Module:
         )
         return unet   # 返回构建好的 MONAI U-Net
     except Exception as e:
-        # MONAI GenerativeModels 未安装或版本不兼容，退回极简 U-Net
+        # monai 版本过低（<1.4.0）或未安装，退回极简 U-Net
         print(f"[UNet] MONAI DiffusionModelUNet 不可用: {e}。使用极简 UNet 替代。")
         return _SimpleUNet3D(
             in_ch=cfg.unet_in_channels,                  # 匹配 VAE 输出通道数
@@ -404,7 +404,7 @@ class MedMD(nn.Module):
         z0 = self._encode(source_mri)   # 编码源图像为潜向量 (B, lat_ch, d, h, w)
 
         # 在 t_start 处加噪（部分扩散：只加到强度 strength 对应的噪声量）
-        t_start = int(noise_strength * self.scheduler.T)   # 计算目标时间步
+        t_start = int(noise_strength * self.scheduler.T)   # 计算目标时间步，后面是总时间步默认1000
         # 构造时间步张量（批内所有样本使用同一 t_start）
         t_tensor = torch.full((z0.shape[0],), t_start - 1,
                               dtype=torch.long, device=z0.device)
