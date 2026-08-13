@@ -54,7 +54,16 @@ class BioMedCLIPEncoder(nn.Module):
             self.tokenizer = open_clip.get_tokenizer(f"hf-hub:{repo_id}")
             # 只保留文本编码器分支，丢弃视觉分支以节省显存
             self.text_encoder = model.text.to(self.device)
-            self.hidden_dim = self.text_encoder.transformer.width
+            # BiomedCLIP-PubMedBERT 的文本塔是 open_clip.HFTextEncoder，
+            # 内部直接封装一个 HuggingFace BertModel（self.text_encoder.transformer），
+            # 与 open_clip 原生 TextTransformer（token_embedding/positional_embedding/
+            # transformer.width/ln_final 手动前向）结构不同，需分支处理。
+            self._is_hf = hasattr(self.text_encoder.transformer, "config")
+            if self._is_hf:
+                self.hidden_dim = self.text_encoder.transformer.config.hidden_size
+                self._pad_token_id = getattr(self.tokenizer.tokenizer, "pad_token_id", 0) or 0
+            else:
+                self.hidden_dim = self.text_encoder.transformer.width
             self._loaded = True
         except Exception as e:
             print(f"[BioMedCLIP] 加载失败: {e}。将使用随机嵌入替代。")
@@ -76,9 +85,17 @@ class BioMedCLIPEncoder(nn.Module):
         # open_clip tokenizer 直接返回 LongTensor (B, context_length)
         tokens = self.tokenizer(texts).to(self.device)
 
+        enc = self.text_encoder
+
+        if self._is_hf:
+            # HFTextEncoder 路径（如 BiomedCLIP-PubMedBERT）：直接调用内部 HF BertModel，
+            # 取 last_hidden_state 作为逐 token 表示，形状 (B, context_length, hidden_dim)
+            attn_mask = (tokens != self._pad_token_id).long()
+            out = enc.transformer(input_ids=tokens, attention_mask=attn_mask)
+            return out.last_hidden_state.float()
+
         # 逐步调用 TextTransformer 内部，取 ln_final 之后、text_projection 之前的
         # 逐 token 表示，形状 (B, context_length, hidden_dim)
-        enc = self.text_encoder
 
         # 第①步：词元嵌入
         # token_embedding 是一个 Embedding(vocab_size, dim) 查找表，

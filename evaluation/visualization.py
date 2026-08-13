@@ -310,6 +310,52 @@ def plot_error_heatmap(
 
 
 # --------------------------------------------------------------------------- #
+#  3D MRI 体积可视化：正中三视图 2D 切片                                          #
+# --------------------------------------------------------------------------- #
+
+def plot_mri_slices(
+    volume: np.ndarray,                 # 3D MRI 体积，形状 (D, H, W) 或 (1, D, H, W)
+    save_path: str,                     # 保存路径（不含扩展名时自动追加）
+    fmt: str = "png",                   # 保存格式（默认 "png"，图像类内容不适合矢量格式）
+    title: Optional[str] = None,        # 图表总标题（如模型/方法名）
+) -> plt.Figure:
+    """
+    保存 3D MRI 体积的正中三视图（轴状/冠状/矢状）2D 切片图。
+
+    分别沿深度/高度/宽度三个轴取正中间的一张 2D 切片，用灰度图并排展示，
+    三张切片共享同一灰度范围（体积的全局 min/max），便于直观比较。
+
+    参数：
+      volume    : 3D MRI 体积数组，值域通常为 [-1, 1]（preprocess_mri 处理后）
+      save_path : 保存路径
+      fmt       : 图片格式（"png"、"jpg" 等，非矢量格式）
+      title     : 可选的图表总标题
+
+    返回：
+      matplotlib Figure 对象
+    """
+    _setup_font()   # 设置字体
+    vol = np.asarray(volume)
+    if vol.ndim == 4:   # (1, D, H, W) → (D, H, W)：去掉通道维
+        vol = vol[0]
+    d, h, w = vol.shape
+    slices = [vol[d // 2, :, :], vol[:, h // 2, :], vol[:, :, w // 2]]   # 正中三个切面
+    names = ["Axial", "Coronal", "Sagittal"]
+    vmin, vmax = float(vol.min()), float(vol.max())   # 三张切片共享灰度范围，便于比较
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    for ax, sl, name in zip(axes, slices, names):
+        ax.imshow(sl, cmap="gray", vmin=vmin, vmax=vmax)   # 灰度显示 MRI 切片
+        ax.set_title(name, fontsize=11)
+        ax.axis("off")   # 隐藏坐标轴（图像类展示不需要）
+    if title:
+        fig.suptitle(title, fontsize=12)
+    fig.tight_layout()
+    save_figure(fig, save_path, fmt=fmt)
+    return fig
+
+
+# --------------------------------------------------------------------------- #
 #  便捷函数：一次保存某方法的全部偏差分析图                                        #
 # --------------------------------------------------------------------------- #
 

@@ -110,6 +110,10 @@ def default_task_specs():
 def main():
     """主函数：解析参数 → 构建数据集 → 顺序运行 5 个方法 → 汇总结果并绘图。"""
     args = parse_args()           # 解析命令行参数
+
+    from utils.log_utils import setup_run_logger   # 终端输出同步保存到 results_dir/run.log
+    setup_run_logger(args.results_dir)
+
     cfg = load_config(args.config)  # 加载配置文件
     set_seed(cfg.training.seed)    # 设置全局随机种子（保证可复现）
 
@@ -241,6 +245,11 @@ def main():
     from utils.timing_utils import save_timing_csv   # 局部导入（避免顶层循环依赖）
     save_timing_csv(os.path.join(results_dir, "timing_breakdown.csv"))
     print("[汇总] 耗时统计已保存至", os.path.join(results_dir, "timing_breakdown.csv"))
+
+    # 保存被判定为不可用而排除的样本清单（重新下载后仍损坏），用于统计真实数据可用率
+    from utils.data_quality_utils import save_unusable_csv
+    save_unusable_csv(os.path.join(results_dir, "unusable_samples.csv"))
+    print("[汇总] 不可用样本清单已保存至", os.path.join(results_dir, "unusable_samples.csv"))
 
 
 def _save_summary_and_figures(all_results: dict, results_dir: str, cfg) -> None:

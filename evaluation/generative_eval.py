@@ -166,6 +166,103 @@ def save_summary(mean: Dict[str, float], std: Dict[str, float], path: str) -> No
     save_csv(pd.DataFrame(rows), path)
 
 
+
+# --------------------------------------------------------------------------- #
+#  随机生成样本可视化（供冒烟测试 / main.py 结尾的可视化功能复用）                    #
+# --------------------------------------------------------------------------- #
+
+@torch.no_grad()   # 生成阶段不需要梯度
+def visualize_random_sample(
+    medmd,                                   # 已训练的 MedMD 生成模型实例
+    mri_shape,                               # 目标 MRI 分辨率 (D, H, W)
+    save_path: str,                          # 2D 切片图保存路径（不含扩展名）
+    fmt: str = "png",                        # 图片格式
+    ddim_steps: int = 20,                    # DDIM 去噪步数
+    age_label: Optional[float] = None,       # 条件年龄标签；None 则在 [20, 80) 内随机采样
+    title: Optional[str] = None,             # 图表标题
+) -> np.ndarray:
+    """
+    用给定 MedMD 生成模型从随机噪声出发生成一个 3D MRI 样本，并保存正中三视图 2D 切片。
+
+    使用 synthesise_from_label（纯噪声起点的条件生成，见 MedMD），
+    而非 img2img 合成，因为可视化只需要"模型能生成什么样的 MRI"，
+    不依赖任何真实源图像。
+
+    参数：
+      medmd      : MedMD 实例（需已加载训练好的权重）
+      mri_shape  : 生成体积的空间分辨率
+      save_path  : 图片保存路径
+      ddim_steps : DDIM 去噪步数（可视化用途，无需很多步）
+      age_label  : 条件年龄标签；None 时随机采样一个年龄（增加可视化多样性）
+
+    返回：
+      生成的体积 (D, H, W) 的 NumPy 数组
+    """
+    if age_label is None:
+        age_label = int(np.random.uniform(20, 80))   # 随机年龄条件，增加样本多样性
+
+    medmd.eval()
+    vol = medmd.synthesise_from_label(
+        age_label, batch_size=1, mri_shape=mri_shape, ddim_steps=ddim_steps,
+    )
+    vol_np = vol[0, 0].detach().cpu().numpy()   # (D, H, W)
+
+    from evaluation.visualization import plot_mri_slices   # 局部导入（避免顶层循环依赖）
+    plot_mri_slices(vol_np, save_path, fmt=fmt,
+                    title=title or f"age={age_label}")
+    return vol_np
+
+
+def visualize_fan_and_m4fed_samples(
+    cfg,                                 # 全局 M4FedConfig 配置对象
+    results_dir: str,                    # 结果根目录（读取 fan/m4fed 子目录下的权重）
+    device: str,                         # 计算设备
+    mri_shape=None,                      # 生成体积分辨率；None 则用 cfg.data.mri_shape
+    fmt: str = "png",                    # 图片格式
+) -> Dict[str, np.ndarray]:
+    """
+    加载 FAN（任一客户端）与 M4Fed（服务器）已训练好的生成模型（MedMD），
+    各自随机生成一个 3D MRI 样本，并将 2D 切片保存到结果文件夹。
+
+    权重路径约定（与 federated/methods/fan.py、m4fed.py 的 save_model 调用一致）：
+      FAN   : {results_dir}/fan/client_0_medmd.pt   （任取一个客户端，此处固定用 client_0）
+      M4Fed : {results_dir}/m4fed/server_medmd.pt
+
+    若权重文件不存在（如该方法未运行或 save_model=False），跳过该方法并打印提示，
+    不抛异常中断整体流程。
+
+    返回：
+      {方法名: 生成的体积 (D, H, W) NumPy 数组}，仅含实际成功生成的方法
+    """
+    import os
+    from models.medmd.medmd import MedMD          # MedMD 生成模型
+    from utils.io_utils import load_model, ensure_dir  # 权重加载 / 目录创建
+
+    mri_shape = tuple(mri_shape or cfg.data.mri_shape)
+    out_dir = ensure_dir(os.path.join(results_dir, "visualization"))
+
+    checkpoints = {
+        "fan_client0": os.path.join(results_dir, "fan", "client_0_medmd.pt"),
+        "m4fed_server": os.path.join(results_dir, "m4fed", "server_medmd.pt"),
+    }
+
+    generated = {}
+    for name, ckpt_path in checkpoints.items():
+        if not os.path.exists(ckpt_path):
+            print(f"[可视化] 跳过 {name}：未找到权重文件 {ckpt_path}")
+            continue
+        medmd = MedMD(cfg.model, device=device).to(device)
+        load_model(medmd, ckpt_path)   # 加载训练好的生成模型权重
+        save_path = os.path.join(out_dir, f"{name}_sample")
+        vol = visualize_random_sample(
+            medmd, mri_shape, save_path, fmt=fmt, title=name,
+        )
+        generated[name] = vol
+        print(f"[可视化] {name} 随机生成 MRI 切片已保存至 {save_path}.{fmt}")
+
+    return generated
+
+
 def save_loss_summary(losses_by_client: Dict[str, list], path: str) -> None:
     """
     计算跨客户端的逐轮损失均值和标准差，保存为 CSV。

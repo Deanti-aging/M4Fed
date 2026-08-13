@@ -3,8 +3,8 @@ federated:
   method: "m4fed"
   n_clients: 2
   warm_rounds: 5
-  federated_rounds: 10
-  local_rounds: 10
+  federated_rounds: 50
+  local_rounds: 50
   synth_ratio_fed: 0.1
   synth_ratio_local: 1.0
 training:

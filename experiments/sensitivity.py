@@ -267,6 +267,8 @@ if __name__ == "__main__":
     p.add_argument("--config", default="configs/m4fed.yaml")   # 配置文件路径
     p.add_argument("--results_dir", default="results")          # 结果保存目录
     args = p.parse_args()   # 解析命令行参数
+    from utils.log_utils import setup_run_logger   # 终端输出同步保存到 results_dir/run.log
+    setup_run_logger(args.results_dir)
     cfg = load_config(args.config)   # 加载 M4FedConfig 配置
     all_ds_ids = list_openmind_ds_ids(cfg.data.hf_dataset_id)
     mri_shape = tuple(cfg.data.mri_shape)

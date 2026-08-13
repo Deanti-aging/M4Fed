@@ -16,6 +16,30 @@ import torch                        # PyTorch 深度学习框架
 import torch.nn as nn               # 神经网络模块（用于构建 MinimalVAE 备用模型）
 from typing import Optional         # 类型注解工具
 
+# MONAI/brats_mri_generative_diffusion 预训练权重文件固定按 latent_channels=8 训练，
+# 结构不匹配时 load_state_dict 必然报 size mismatch，无需真的下载权重再尝试加载
+_PRETRAINED_LATENT_CHANNELS = 8
+
+
+def _remap_legacy_keys(state: dict, model_keys: dict) -> dict:
+    """
+    兼容旧版 monai-generative 导出的权重与当前 monai 核心包 AutoencoderKL 的子模块命名差异。
+
+    旧版 decoder/encoder 上采样残差块的输出卷积子模块名为 "conv"（如
+    "decoder.blocks.3.conv.conv.weight"），合并进 monai 核心包后重构为
+    "postconv"（"decoder.blocks.3.postconv.conv.weight"）。此处按需重命名，
+    使旧权重文件可以在新版 monai 上无损加载。
+    """
+    own_keys = set(model_keys.keys())
+    remapped = {}
+    for k, v in state.items():
+        if k in own_keys:
+            remapped[k] = v
+            continue
+        alt = k.replace(".conv.conv.", ".postconv.conv.")
+        remapped[alt if alt in own_keys else k] = v
+    return remapped
+
 
 def load_vae(
     repo_id: Optional[str] = None,
@@ -54,7 +78,7 @@ def load_vae(
             in_channels=in_channels,                               # 输入通道（灰度 MRI = 1）
             out_channels=out_channels,                             # 输出通道（重建与输入一致）
             latent_channels=latent_channels,                       # 潜空间通道数（=8，与 UNet 输入一致）
-            num_channels=(64, 128, 256),                           # 3 个分辨率级别的特征通道数
+            channels=(64, 128, 256),                               # 3 个分辨率级别的特征通道数
             attention_levels=(False, False, False),                # 无空间注意力（与预训练权重设置一致）
             with_encoder_nonlocal_attn=False,                      # 编码器不使用非局部注意力
             with_decoder_nonlocal_attn=False,                      # 解码器不使用非局部注意力
@@ -63,7 +87,12 @@ def load_vae(
             norm_eps=1e-6,                                         # 归一化层的数值稳定系数，其作用是在分母中加上一个极小值，防止方差为零时出现除以零的数值错误。1e-6 是一个常见的标准选择，足够小不影响计算精度，又足够大避免数值不稳定。
         )
         # 尝试从 HuggingFace Hub 下载预训练权重（首次下载后本地缓存）
-        if repo_id:
+        if repo_id and latent_channels != _PRETRAINED_LATENT_CHANNELS:
+            # latent_channels 与预训练权重固定的通道数不一致（如冒烟测试/消融实验为提速
+            # 缩小了模型），下载并加载必然因 size mismatch 失败，直接跳过节省网络请求和噪声日志
+            print(f"[VAE] latent_channels={latent_channels}（≠ 预训练权重固定的 "
+                  f"{_PRETRAINED_LATENT_CHANNELS}），跳过预训练权重加载，使用随机初始化。")
+        elif repo_id:
             try:
                 from huggingface_hub import hf_hub_download         # HuggingFace 文件下载工具
                 weight_path = hf_hub_download(
@@ -72,6 +101,7 @@ def load_vae(
                     cache_dir=None,                                  # 使用默认缓存目录（~/.cache/huggingface）
                 )
                 state = torch.load(weight_path, map_location="cpu", weights_only=True)  # 加载到 CPU
+                state = _remap_legacy_keys(state, vae.state_dict())  # 兼容旧版 monai-generative 的子模块命名
                 vae.load_state_dict(state)                          # 将预训练权重写入 VAE
                 print(f"[VAE] 已加载预训练权重：{repo_id}")
             except Exception as e:

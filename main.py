@@ -22,6 +22,9 @@ import sys                            # sys.path 修改和 sys.exit
 # （在从任意工作目录运行 main.py 时保证 `from configs import ...` 等能找到包）
 sys.path.insert(0, os.path.dirname(__file__))
 
+from utils.env_utils import load_local_env   # 从 .env.local 加载本地密钥（如 TABPFN_TOKEN）
+load_local_env()   # 必须在其他模块（可能间接触发 tabpfn 等库读取环境变量）导入前执行
+
 from utils.seed_utils import set_seed   # 全局随机种子设置（保证可复现）
 
 
@@ -61,6 +64,12 @@ def main():
       - cross_site : 调用 experiments/cross_site.run_cross_site()
     """
     args = parse_args()   # 解析命令行参数
+
+    # 尽早重定向 stdout/stderr：此后所有终端输出（含本函数下方的打印和各实验模块的打印）
+    # 都会同步保存到 {results_dir}/run.log，终端显示效果不变，方便训练结束后回看
+    from utils.log_utils import setup_run_logger
+    log_path = setup_run_logger(args.results_dir)
+    print(f"[main] 终端日志将同步保存至 {log_path}")
 
     # 加载 YAML 配置（若 YAML 文件不存在则退回默认 M4FedConfig）
     from configs import load_config
@@ -165,6 +174,17 @@ def main():
     # ------------------------------------------------------------------
     from utils.timing_utils import save_timing_csv
     save_timing_csv(os.path.join(args.results_dir, "timing_breakdown.csv"))
+
+    # 保存被判定为不可用而排除的样本清单（重新下载后仍损坏），用于统计真实数据可用率
+    from utils.data_quality_utils import save_unusable_csv
+    save_unusable_csv(os.path.join(args.results_dir, "unusable_samples.csv"))
+
+    # 可视化功能：加载 FAN（任一客户端，此处固定用 client_0）与 M4Fed（server）
+    # 已训练完成的生成模型，各随机生成一个 3D MRI 并保存 2D 切片。
+    # 权重文件不存在时（如本次只运行了 ablation/sensitivity/cross_site 等未训练该方法的模式）
+    # 会跳过对应方法并打印提示，不影响主流程。
+    from evaluation.generative_eval import visualize_fan_and_m4fed_samples
+    visualize_fan_and_m4fed_samples(cfg, args.results_dir, cfg.training.device, mri_shape=mri_shape)
 
 
 def _load_ds_ids(cfg) -> list:

@@ -11,7 +11,7 @@ from __future__ import annotations   # 允许注解中使用尚未定义的类�
 import os                             # 标准库：路径操作（供 ensure_dir 等使用）
 import torch                          # PyTorch 深度学习框架
 import torch.optim as optim           # 优化器模块（AdamW）
-from torch.cuda.amp import GradScaler, autocast  # 混合精度训练工具（FP16/BF16）
+from torch.amp import GradScaler, autocast  # 混合精度训练工具（FP16/BF16）
 from torch.utils.data import DataLoader           # PyTorch 数据加载器
 from typing import Dict, List, Optional           # 类型注解工具
 
@@ -64,7 +64,7 @@ class MedMDTrainer:
         # 混合精度仅在 CUDA 设备上有意义（CPU 不支持 FP16 加速）
         self.mixed_precision = mixed_precision and (device == "cuda")
         # 若启用混合精度，创建 GradScaler（用于防止 FP16 下溢）；否则为 None
-        self.scaler = GradScaler() if self.mixed_precision else None
+        self.scaler = GradScaler("cuda") if self.mixed_precision else None
 
         if use_qlora:
             # QLoRA 模式：为 U-Net 中的线性层添加 LoRA 适配器，冻结原始权重
@@ -114,7 +114,7 @@ class MedMDTrainer:
             self.optimizer.zero_grad()   # 清空上一步的梯度（必须在每步前执行）
             if self.mixed_precision:
                 # FP16 混合精度训练
-                with autocast():   # autocast 自动选择合适的精度（FP16/FP32）
+                with autocast("cuda"):   # autocast 自动选择合适的精度（FP16/FP32）
                     loss = self.model(mri, texts)   # 前向传播：计算 LDM 损失
                 self.scaler.scale(loss).backward()   # 缩放损失后反向传播
                 self.scaler.unscale_(self.optimizer)  # 还原梯度量级（为梯度裁剪准备）

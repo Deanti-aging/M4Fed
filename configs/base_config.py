@@ -80,7 +80,9 @@ class ModelConfig:
     unet_attention_levels: List[bool] = field(default_factory=lambda: [False, False, True, True])
     # 组归一化的分组数（须整除所有通道数，否则 MONAI 报错）
     unet_norm_num_groups: int = 32
-    # 交叉注意力维度（与 BioMedCLIP 文本嵌入维度对齐，须与 biomedclip_repo 的输出维度一致）
+    # 交叉注意力维度（U-Net 内部使用）。MedMD 会用一个冻结投影层将 BioMedCLIP 的文本嵌入
+    # （biomedclip_repo 对应的 HF BertModel 隐藏维度，PubMedBERT 为 768）对齐到这一维度，
+    # 因此该值可自由配置，无需与 biomedclip_repo 的输出维度一致（如冒烟测试用更小的值提速）。
     unet_cross_attention_dim: int = 512
     # BioMedCLIP 文本编码器的 HuggingFace 仓库 ID（Microsoft 发布的生物医学 CLIP）
     biomedclip_repo: str = "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
@@ -132,9 +134,9 @@ class FederatedConfig:
     # 热身阶段轮数（服务器用公开数据预训练 MedMD，使 U-Net 具备基本扩散能力）
     warm_rounds: int = 5
     # 联邦循环轮数（客户端↔服务器交换合成 MRI 数据并更新领域模型的轮数）
-    federated_rounds: int = 10
+    federated_rounds: int = 50
     # 本地训练阶段每个节点的训练轮数（Phase 3：使用合成 + 私有数据微调 SwinMultiTask）
-    local_rounds: int = 10
+    local_rounds: int = 50
     # 联邦循环阶段的合成数据比例（相对于本地私有数据量）
     # 0.1 = 合成 10% 的数据（较保守，避免联邦循环初期合成质量较低时引入噪声）
     synth_ratio_fed: float = 0.1

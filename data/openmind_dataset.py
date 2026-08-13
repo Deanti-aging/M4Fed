@@ -37,6 +37,7 @@ from .preprocessing import preprocess_mri, preprocess_table   # MRI 和表格预
 from .table_to_text import table_row_to_text                   # 表格行 → 自然语言描述
 from .splits import assign_ds_splits, train_test_split_indices  # 数据集划分函数
 from utils.timing_utils import time_block, record_timing        # 耗时计时工具
+from utils.data_quality_utils import record_unusable_sample     # 不可用样本统计工具
 
 
 # =========================================================================== #
@@ -46,6 +47,15 @@ from utils.timing_utils import time_block, record_timing        # 耗时计时�
 # 惰性下载的 NIfTI 文件默认落盘目录（未配置 cache_dir 时使用）
 # 路径示例：<项目根目录>/data/mri_cache
 _DEFAULT_MRI_LOCAL_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "mri_cache")
+
+
+class _UnusableSample(Exception):
+    """内部信号：样本的 MRI 文件确认不可用（重新下载后仍损坏）。
+
+    由 OpenMindDataset._load_mri 抛出，__getitem__ 捕获后改用数据集内的
+    下一个样本，而不是用随机噪声顶替——避免真实标签与伪造体素配对，
+    污染训练/评估信号。
+    """
 
 
 class _LRUDiskCache:
@@ -205,15 +215,26 @@ class OpenMindDataset(Dataset):
           'age'      : 0 维 float32 张量（可能为 nan，NaN 样本在损失计算时被遮蔽）
           'metadata' : pd.Series 或 dict，原始元数据（用于偏差分析时的分组）
 
+        若第 idx 个样本被判定为不可用（NIfTI 文件重新下载后仍损坏），改用数据集内
+        下一个可用样本的完整字典（image/text/age/metadata 全部一起替换，避免真实
+        图像与其他样本的标签错配）；被跳过的样本会被永久标记，之后不再重试下载。
+
         参数：
           idx : 样本索引（0 到 len-1）
         """
-        s = self.samples[idx]   # 取出第 idx 个样本字典
-
-        # 步骤 1：加载 MRI 体积
-        # 优先顺序：内存数组（mri_array）> 本地磁盘文件（mri_path）>
-        #           HuggingFace 惰性下载（hf_image_path）> 随机噪声（兜底）
-        vol = self._load_mri(s)                           # 加载原始体积（numpy ndarray）
+        idx = idx % len(self.samples)
+        for _ in range(len(self.samples)):
+            s = self.samples[idx]   # 取出候选样本字典
+            try:
+                # 步骤 1：加载 MRI 体积
+                # 优先顺序：内存数组（mri_array）> 本地磁盘文件（mri_path）>
+                #           HuggingFace 惰性下载（hf_image_path）> 随机噪声（兜底，仅无任何来源时）
+                vol = self._load_mri(s)                           # 加载原始体积（numpy ndarray）
+                break
+            except _UnusableSample:
+                idx = (idx + 1) % len(self.samples)   # 该样本已被 _load_mri 标记不可用，尝试下一个
+        else:
+            raise RuntimeError("数据集内全部样本均已被判定为不可用，无法构建批次")
 
         # 步骤 2：MRI 预处理（百分位裁剪 → [-1,1] 归一化 → 插值到目标尺寸）
         mri_tensor = preprocess_mri(vol, self.mri_shape)  # 输出形状：(1, D, H, W)
@@ -256,14 +277,25 @@ class OpenMindDataset(Dataset):
           2. 本地磁盘上的 NIfTI 文件（mri_path）——需要 nibabel
           3. HuggingFace 仓库中的远程 NIfTI 文件（hf_repo_id + hf_image_path）——
              惰性下载，下载后写回 s["mri_path"] 缓存为本地路径
-          4. 随机噪声体积——兜底 fallback（仅单元测试中使用）
+          4. 随机噪声体积——兜底 fallback（仅样本本身未提供任何来源时，如单元测试）
+
+        重新下载后仍损坏的文件视为不可用：标记 s["_unusable"]=True、记录统计并抛出
+        _UnusableSample，由调用方 __getitem__ 改用数据集内下一个样本（而非返回随机
+        噪声顶替——那样会让真实标签与伪造体素配对，污染训练/评估信号）。
 
         参数：
           s : 样本字典
 
         返回：
           numpy float32 数组（形状不固定，后续 preprocess_mri 会插值到目标尺寸）
+
+        抛出：
+          _UnusableSample : 该样本已被判定为不可用（重新下载后仍损坏）
         """
+        # 已被判定为不可用的样本：跳过整个加载链，直接短路，避免重复触发下载
+        if s.get("_unusable"):
+            raise _UnusableSample()
+
         # 优先级 1：直接使用内存中的 numpy 数组
         if "mri_array" in s and s["mri_array"] is not None:
             return s["mri_array"]   # 返回内存数组（虚拟模式/合成数据使用此路径）
@@ -277,14 +309,40 @@ class OpenMindDataset(Dataset):
         if mri_path and os.path.exists(mri_path):
             if not HAS_NIBABEL:
                 raise ImportError("加载 NIfTI 文件需要安装 nibabel 库")
-            img = nib.load(mri_path)            # 使用 nibabel 加载 NIfTI 文件
-            return img.get_fdata(dtype=np.float32)  # 返回 float32 体积数组
+            try:
+                img = nib.load(mri_path)                 # 使用 nibabel 加载 NIfTI 文件
+                return img.get_fdata(dtype=np.float32)    # 返回 float32 体积数组
+            except (EOFError, OSError) as e:
+                # 缓存文件损坏（如上次下载被中断，gzip 流不完整）：删除损坏文件，
+                # 若来自 HuggingFace 则重新下载一次；否则直接抛出，避免无限重试
+                print(f"[MRI] 缓存文件损坏，将删除并重新获取: {mri_path}（{e}）")
+                os.remove(mri_path)
+                if s.get("hf_image_path"):
+                    s["mri_path"] = None                  # 清空缓存路径，强制重新下载
+                    try:
+                        # force_download=True：跳过 huggingface_hub 自己按 ETag 判定“已下载完整”
+                        # 的 blob 缓存（否则会直接复制同一份已损坏的缓存 blob，重试等于白重试）
+                        mri_path = self._resolve_hf_path(s, force_download=True)
+                        img = nib.load(mri_path)
+                        return img.get_fdata(dtype=np.float32)
+                    except (EOFError, OSError) as e2:
+                        # 重新下载后仍然损坏：说明远端源文件本身就是坏的（而非本地缓存问题），
+                        # 重试无法解决。标记该样本永久不可用并记录统计，交由 __getitem__
+                        # 改用数据集内下一个样本，避免单个坏样本拖垮整个训练/评估循环，
+                        # 同时避免"随机噪声 + 真实标签"这种错配数据污染训练/评估信号。
+                        identifier = s.get("hf_image_path") or mri_path
+                        s["_unusable"] = True
+                        record_unusable_sample(identifier, f"重新下载后仍损坏: {e2}")
+                        print(f"[MRI] 重新下载后仍损坏，视为不可用样本并排除: "
+                              f"{identifier}（{e2}）")
+                        raise _UnusableSample() from e2
+                raise
 
         # 优先级 4（兜底）：返回随机噪声体积
         return np.random.randn(*self.mri_shape).astype(np.float32)
 
     @staticmethod
-    def _resolve_hf_path(s: dict) -> str:
+    def _resolve_hf_path(s: dict, force_download: bool = False) -> str:
         """
         从 HuggingFace 仓库惰性下载 s["hf_image_path"]（首次访问时下载，
         之后命中 LRU 磁盘缓存），并将解析出的本地路径写回 s["mri_path"]，
@@ -297,7 +355,10 @@ class OpenMindDataset(Dataset):
           - 下载后调用 _LRUDiskCache.note_access() 更新访问时间并按需淘汰旧文件
 
         参数：
-          s : 样本字典（含 hf_repo_id、hf_image_path、hf_local_dir、hf_max_cache_bytes）
+          s              : 样本字典（含 hf_repo_id、hf_image_path、hf_local_dir、hf_max_cache_bytes）
+          force_download : True 时跳过 huggingface_hub 按 ETag 判定的 blob 缓存，强制重新
+                           从远端下载（用于修复本地缓存文件损坏——若只删本地 local_dir 副本、
+                           不带此参数重新调用，hf_hub_download 会直接复制同一份已损坏的 blob）
 
         返回：
           本地文件的绝对路径（可直接传给 nibabel 读取）
@@ -307,14 +368,15 @@ class OpenMindDataset(Dataset):
         # 将 HuggingFace 仓库内的相对路径映射为本地绝对路径
         target_path = os.path.join(local_dir, *s["hf_image_path"].split("/"))
 
-        if not os.path.exists(target_path):
-            # 文件不在缓存中，触发网络下载（计时，记录网络下载耗时）
+        if force_download or not os.path.exists(target_path):
+            # 文件不在缓存中（或强制刷新），触发网络下载（计时，记录网络下载耗时）
             with time_block("network_download/mri_files"):
                 hf_hub_download(
                     repo_id=s["hf_repo_id"],           # HuggingFace 仓库 ID
                     filename=s["hf_image_path"],        # 仓库内相对路径（如 ds000001/sub-01/.../T1w.nii.gz）
                     repo_type="dataset",                # 仓库类型（数据集，非模型）
                     local_dir=local_dir,               # 下载到普通文件（而非 HF blob+symlink 缓存）
+                    force_download=force_download,     # 强制绕过 blob 缓存重新下载
                 )
 
         # 将本地路径写回样本字典（下次 _load_mri 直接走优先级 2，跳过 HuggingFace 路径解析）
@@ -613,6 +675,11 @@ def make_openmind_sample_loader(
     # 按 ds_id 分组，建立 {ds_id: DataFrame} 字典（O(1) 查询每个子数据集的行）
     grouped = {ds_id: g for ds_id, g in df.groupby("ds_id")}
 
+    # CSV 的 image_path 列（如 "ds000001/sub-01/anat/..."）是相对于仓库内 NIfTI 存放目录的路径，
+    # 该目录以仓库名同名（如 "AnonRes/OpenMind" 仓库下实际存放于 "OpenMind/ds000001/..."），
+    # 需要拼接该前缀才能作为 hf_hub_download 的 filename 使用
+    _repo_data_prefix = repo_id.split("/")[-1]
+
     # 对 _CATEGORICAL_PRED_FIELDS 中的类别型字段拟合标签编码映射
     # 在全量 df 上统计所有可能取值，保证编码跨子数据集一致
     label_maps: dict = {}   # {字段名: {字符串值: 整数索引}}
@@ -652,7 +719,7 @@ def make_openmind_sample_loader(
                 continue
             sample = {
                 "hf_repo_id": repo_id,                         # HuggingFace 仓库 ID
-                "hf_image_path": row["image_path"],             # NIfTI 文件仓库内相对路径
+                "hf_image_path": f"{_repo_data_prefix}/{row['image_path']}",  # NIfTI 文件仓库内相对路径（含仓库名前缀目录）
                 "hf_local_dir": mri_local_dir,                 # 本地 NIfTI 文件缓存目录
                 "hf_max_cache_bytes": max_cache_bytes,          # LRU 缓存容量（字节）
                 # 只用人口学/健康字段生成文本（reindex 确保列顺序一致且不包含技术字段）
@@ -823,6 +890,8 @@ def make_dataloader(
     """
     generator = torch.Generator()             # 创建独立的随机数生成器
     generator.manual_seed(seed)               # 设置种子（保证 shuffle 可复现）
+    # 数据集为空时 RandomSampler 会因 num_samples=0 报错，退回 SequentialSampler（同样产出 0 个批次）
+    shuffle = shuffle and len(dataset) > 0
     return DataLoader(
         dataset,                              # 数据集对象
         batch_size=batch_size,               # 批大小

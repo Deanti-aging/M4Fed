@@ -19,6 +19,9 @@ from __future__ import annotations
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from utils.env_utils import load_local_env   # 从 .env.local 加载本地密钥（如 TABPFN_TOKEN）
+load_local_env()   # 必须在其他模块导入前执行（本文件可独立于 main.py 运行）
+
 import traceback
 import torch
 
@@ -47,8 +50,8 @@ def _smoke_cfg():
         seed=42,
     )
     cfg.model = ModelConfig(
-        unet_in_channels=2,
-        unet_out_channels=2,
+        unet_in_channels=8,
+        unet_out_channels=8,
         unet_num_channels=[8, 8],
         unet_attention_levels=[False, True],
         unet_norm_num_groups=4,
@@ -168,9 +171,14 @@ def test_fed_fedprox():
 
 
 def test_fed_fan():
-    """FAN 完整联邦学习流程（3 客户端，2 轮）。"""
+    """FAN 完整联邦学习流程（3 客户端，2 轮）。
+
+    开启 save_model，使 client_0 的 MedMD 权重（client_0_medmd.pt）落盘，
+    供末尾的可视化功能加载生成随机 MRI 样本。
+    """
     print("SMOKE: FAN end-to-end (3 clients, 2 rounds) ... ", end="")
     cfg = _smoke_cfg()
+    cfg.eval.save_model = True
     nd, sample_fn = _build_datasets(cfg, n_clients=3)
     from federated.server import Server
     from federated.client import Client
@@ -278,7 +286,7 @@ def test_cross_site():
     """跨站点泛化：在真实跨站点数据上评估 SwinMultiTask 端对端推理流程。"""
     print("SMOKE: Cross-site generalisation ... ", end="")
     cfg = _smoke_cfg()
-    nd = _build_datasets(cfg, n_clients=2)
+    nd, sample_fn = _build_datasets(cfg, n_clients=2)
     cross_ds = nd["cross"]["all"]
     from experiments.cross_site import run_cross_site
     res = run_cross_site(_Args(), cfg, cross_ds, "results/test", model_path=None)
@@ -298,7 +306,29 @@ ALL_TESTS = [
 ]
 
 
+# ============================================================= #
+#  5. 生成样本可视化（FAN / M4Fed）                                  #
+# ============================================================= #
+
+def visualize_generated_samples():
+    """
+    加载 FAN（client_0）与 M4Fed（server）冒烟测试中训练完成的生成模型，
+    各随机生成一个 3D MRI 并保存 2D 切片到 results/test/visualization/。
+    """
+    print("SMOKE: FAN / M4Fed 生成样本可视化 ... ", end="")
+    from evaluation.generative_eval import visualize_fan_and_m4fed_samples
+    cfg = _smoke_cfg()
+    visualize_fan_and_m4fed_samples(cfg, "results/test", DEVICE, mri_shape=MRI_SHAPE)
+    print("PASS")
+
+
 if __name__ == "__main__":
+    # 终端输出（含各冒烟测试的 PASS/FAIL 及异常回溯）同步保存到 results/test/run.log，
+    # 便于事后查看失败原因（终端显示效果不变）
+    from utils.log_utils import setup_run_logger
+    log_path = setup_run_logger("results/test")
+    print(f"[unit_test] 终端日志将同步保存至 {log_path}")
+
     passed = 0
     failed = 0
     for test_fn in ALL_TESTS:
@@ -311,6 +341,15 @@ if __name__ == "__main__":
             failed += 1
     print(f"\n{'='*50}")
     print(f"结果：{passed} 通过，{failed} 失败，共 {len(ALL_TESTS)} 个冒烟测试。")
+
+    # 可视化功能不计入冒烟测试通过/失败统计（依赖前面测试留下的模型权重，
+    # 权重缺失或生成异常不应影响冒烟测试本身的退出码）
+    try:
+        visualize_generated_samples()
+    except Exception as e:
+        print(f"FAIL ({type(e).__name__}: {e})")
+        traceback.print_exc()
+
     if failed == 0:
         print("所有冒烟测试通过！")
     else:

@@ -1,0 +1,158 @@
+
+======================================================================
+运行开始：2026-08-08 17:09:55
+======================================================================
+[unit_test] 终端日志将同步保存至 results/test\run.log
+SMOKE: FedAvg end-to-end (3 clients, 2 rounds) ... Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[VAE] 已加载预训练权重：MONAI/brats_mri_generative_diffusion
+[MedMD] VAE scale_factor 已校准: 1.00000 → 1.07869（潜向量 std=0.9270，共 8 个批次）
+[SwinUNETR] 随机初始化骨干（消融实验，feature_size=48）。
+[VAE] 已加载预训练权重：MONAI/brats_mri_generative_diffusion
+[MedMD] VAE scale_factor 已校准: 1.00000 → 1.03648（潜向量 std=0.9648，共 8 个批次）
+[SwinUNETR] 随机初始化骨干（消融实验，feature_size=48）。
+[VAE] 已加载预训练权重：MONAI/brats_mri_generative_diffusion
+[MedMD] VAE scale_factor 已校准: 1.00000 → 1.04467（潜向量 std=0.9572，共 8 个批次）
+[SwinUNETR] 随机初始化骨干（消融实验，feature_size=48）。
+[FedAvg] 第 1/2 轮
+[FedAvg] 第 2/2 轮
+PASS
+SMOKE: FedProx end-to-end (3 clients, 2 rounds) ... [VAE] 已加载预训练权重：MONAI/brats_mri_generative_diffusion
+[MedMD] VAE scale_factor 已校准: 1.00000 → 1.07869（潜向量 std=0.9270，共 8 个批次）
+[SwinUNETR] 随机初始化骨干（消融实验，feature_size=48）。
+[VAE] 已加载预训练权重：MONAI/brats_mri_generative_diffusion
+[MedMD] VAE scale_factor 已校准: 1.00000 → 1.03648（潜向量 std=0.9648，共 8 个批次）
+[SwinUNETR] 随机初始化骨干（消融实验，feature_size=48）。
+[VAE] 已加载预训练权重：MONAI/brats_mri_generative_diffusion
+[MedMD] VAE scale_factor 已校准: 1.00000 → 1.04467（潜向量 std=0.9572，共 8 个批次）
+[SwinUNETR] 随机初始化骨干（消融实验，feature_size=48）。
+[FedProx] 第 1/2 轮，μ=0.001
+[FedProx] 第 2/2 轮，μ=0.001
+PASS
+SMOKE: FAN end-to-end (3 clients, 2 rounds) ... [VAE] 已加载预训练权重：MONAI/brats_mri_generative_diffusion
+[MedMD] VAE scale_factor 已校准: 1.00000 → 1.07869（潜向量 std=0.9270，共 8 个批次）
+[SwinUNETR] 随机初始化骨干（消融实验，feature_size=48）。
+[VAE] 已加载预训练权重：MONAI/brats_mri_generative_diffusion
+[MedMD] VAE scale_factor 已校准: 1.00000 → 1.03648（潜向量 std=0.9648，共 8 个批次）
+[SwinUNETR] 随机初始化骨干（消融实验，feature_size=48）。
+[VAE] 已加载预训练权重：MONAI/brats_mri_generative_diffusion
+[MedMD] VAE scale_factor 已校准: 1.00000 → 1.04467（潜向量 std=0.9572，共 8 个批次）
+[SwinUNETR] 随机初始化骨干（消融实验，feature_size=48）。
+[FAN] === 热身阶段 ===
+[FAN] 标签平衡过采样：37 → 49 个样本条目
+[FAN] 标签平衡过采样：24 → 40 个样本条目
+[FAN] 标签平衡过采样：33 → 51 个样本条目
+[FAN] === 联邦循环阶段 ===
+[FAN] 第 1/2 轮
+[FAN] 第 2/2 轮
+[FAN] === 本地训练阶段 ===
+Setting up [LPIPS] perceptual loss: trunk [vgg], v[0.1], spatial [off]
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\torchvision\models\_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\torchvision\models\_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=VGG16_Weights.IMAGENET1K_V1`. You can also use `weights=VGG16_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+Loading model from: C:\Applications\Miniconda\envs\m4fed\lib\site-packages\lpips\weights\v0.1\vgg.pth
+Creating feature extractor "inception-v3-compat" with features ['2048']
+Extracting features from input1
+Looking for samples non-recursivelty in "C:\Users\wxg38\AppData\Local\Temp\tmpb5h3xrwb\real" with extensions png,jpg,jpeg
+Found 13 samples
+Processing samples:   0%|          | 0/13 [00:00<?, ?samples/s]Processing samples: 100%|##########| 13/13 [00:09<00:00,  1.43samples/s]                                                                        Processing samples
+Extracting features from input2
+Looking for samples non-recursivelty in "C:\Users\wxg38\AppData\Local\Temp\tmpb5h3xrwb\fake" with extensions png,jpg,jpeg
+Found 13 samples
+Processing samples:   0%|          | 0/13 [00:00<?, ?samples/s]Processing samples: 100%|##########| 13/13 [00:05<00:00,  2.57samples/s]                                                                        Processing samples
+Frechet Inception Distance: 339.7478
+Kernel Inception Distance:   0%|          | 0/100 [00:00<?, ?subsets/s]                                                                       Kernel Inception Distance: 0.5111393 ± 2.003851e-07
+Setting up [LPIPS] perceptual loss: trunk [vgg], v[0.1], spatial [off]
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\torchvision\models\_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\torchvision\models\_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=VGG16_Weights.IMAGENET1K_V1`. You can also use `weights=VGG16_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+Loading model from: C:\Applications\Miniconda\envs\m4fed\lib\site-packages\lpips\weights\v0.1\vgg.pth
+Creating feature extractor "inception-v3-compat" with features ['2048']
+Extracting features from input1
+Looking for samples non-recursivelty in "C:\Users\wxg38\AppData\Local\Temp\tmppsct5x5z\real" with extensions png,jpg,jpeg
+Found 9 samples
+Processing samples:   0%|          | 0/9 [00:00<?, ?samples/s]Processing samples: 100%|##########| 9/9 [00:05<00:00,  1.70samples/s]                                                                      Processing samples
+Extracting features from input2
+Looking for samples non-recursivelty in "C:\Users\wxg38\AppData\Local\Temp\tmppsct5x5z\fake" with extensions png,jpg,jpeg
+Found 9 samples
+Processing samples:   0%|          | 0/9 [00:00<?, ?samples/s]Processing samples: 100%|##########| 9/9 [00:04<00:00,  1.88samples/s]                                                                      Processing samples
+Frechet Inception Distance: 330.8022
+Kernel Inception Distance:   0%|          | 0/100 [00:00<?, ?subsets/s]                                                                       Kernel Inception Distance: 0.4398484 ± 1.389389e-07
+Setting up [LPIPS] perceptual loss: trunk [vgg], v[0.1], spatial [off]
+Loading model from: C:\Applications\Miniconda\envs\m4fed\lib\site-packages\lpips\weights\v0.1\vgg.pth
+Creating feature extractor "inception-v3-compat" with features ['2048']
+Extracting features from input1
+Looking for samples non-recursivelty in "C:\Users\wxg38\AppData\Local\Temp\tmpjieor8j1\real" with extensions png,jpg,jpeg
+Found 11 samples
+Processing samples:   0%|          | 0/11 [00:00<?, ?samples/s]Processing samples: 100%|##########| 11/11 [00:04<00:00,  2.24samples/s]                                                                        Processing samples
+Extracting features from input2
+Looking for samples non-recursivelty in "C:\Users\wxg38\AppData\Local\Temp\tmpjieor8j1\fake" with extensions png,jpg,jpeg
+Found 11 samples
+Processing samples:   0%|          | 0/11 [00:00<?, ?samples/s]Processing samples: 100%|##########| 11/11 [00:04<00:00,  2.23samples/s]                                                                        Processing samples
+Frechet Inception Distance: 323.7525
+Kernel Inception Distance:   0%|          | 0/100 [00:00<?, ?subsets/s]                                                                       Kernel Inception Distance: 0.4340558 ± 2.282352e-07
+PASS
+SMOKE: M4Fed end-to-end (2 clients, 2 rounds) ... [VAE] 已加载预训练权重：MONAI/brats_mri_generative_diffusion
+[MedMD] VAE scale_factor 已校准: 1.00000 → 1.09552（潜向量 std=0.9128，共 8 个批次）
+[SwinUNETR] 预训练权重加载成功（feature_size=48）。
+[VAE] 已加载预训练权重：MONAI/brats_mri_generative_diffusion
+[MedMD] VAE scale_factor 已校准: 1.00000 → 1.07869（潜向量 std=0.9270，共 8 个批次）
+[SwinUNETR] 预训练权重加载成功（feature_size=48）。
+[VAE] 已加载预训练权重：MONAI/brats_mri_generative_diffusion
+[MedMD] VAE scale_factor 已校准: 1.00000 → 1.03648（潜向量 std=0.9648，共 8 个批次）
+[SwinUNETR] 预训练权重加载成功（feature_size=48）。
+[M4Fed] === 阶段 1：热身 ===
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Applications\Miniconda\envs\m4fed\lib\site-packages\numpy\lib\_nanfunctions_impl.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+[M4Fed] 热身：TabPFN 表格补全完成。

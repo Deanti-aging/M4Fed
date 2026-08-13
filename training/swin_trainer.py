@@ -15,7 +15,7 @@ SwinUNETR 多任务训练循环（领域模型：脑年龄预测 + 辅助分类�
 from __future__ import annotations    # 允许注解中使用尚未定义的类名
 import torch                           # PyTorch 深度学习框架
 import torch.optim as optim            # 优化器（AdamW）
-from torch.cuda.amp import GradScaler, autocast  # 混合精度训练工具
+from torch.amp import GradScaler, autocast  # 混合精度训练工具
 from torch.utils.data import DataLoader           # PyTorch 数据加载器
 from typing import Dict, List, Optional, Tuple    # 类型注解工具
 
@@ -66,7 +66,7 @@ class SwinTrainer:
         # 混合精度仅在 CUDA 设备上有效（CPU 不支持 FP16 加速）
         self.mixed_precision = mixed_precision and (device == "cuda")
         # 创建 GradScaler（FP16 梯度缩放，防止下溢）；仅在混合精度模式下使用
-        self.scaler = GradScaler() if self.mixed_precision else None
+        self.scaler = GradScaler("cuda") if self.mixed_precision else None
 
         if use_qlora:
             # QLoRA 模式：仅对骨干网络的线性层添加 LoRA 适配器（任务头始终全量训练）
@@ -130,10 +130,17 @@ class SwinTrainer:
                         vals.append(float("nan"))   # 无法转换时设为 NaN（如 "unknown"）
                 # 将 float 列表转为 float32 张量并移到计算设备
                 targets[field] = torch.tensor(vals, dtype=torch.float32, device=self.device)
-            elif field in batch:
-                # metadata 不可用时的向后兼容路径：直接从 batch 中取预堆叠张量
-                # 适用于 age、health_status、race 等已在 _collate_fn 中堆叠好的字段
-                targets[field] = batch[field].to(self.device)
+            # 逐样本回退：metadata 缺失该字段（如合成数据的 metadata={}）时，
+            # 用 batch 中已预堆叠好的同名字段（_collate_fn 产出的 age/health_status/race）补齐，
+            # 否则该字段全为 NaN，compute_loss 会把这个任务整批遮蔽，loss 脱离计算图导致 backward() 报错
+            if field in batch:
+                batch_vals = batch[field].to(self.device)
+                if field in targets:
+                    nan_mask = torch.isnan(targets[field])
+                    if nan_mask.any():
+                        targets[field] = torch.where(nan_mask, batch_vals, targets[field])
+                else:
+                    targets[field] = batch_vals
         return targets   # 返回各任务的目标张量字典
 
     def train_epoch(self, loader: DataLoader) -> float:
@@ -163,7 +170,7 @@ class SwinTrainer:
             self.optimizer.zero_grad()   # 清空梯度（每步前必须执行）
             if self.mixed_precision:
                 # FP16 混合精度训练
-                with autocast():   # 前向传播使用 FP16
+                with autocast("cuda"):   # 前向传播使用 FP16
                     preds = self.model(mri)                       # 骨干特征提取 + 任务头预测
                     loss = self.model.compute_loss(preds, targets)  # 多任务加权损失
                     loss = loss + self._proximal_term()           # 加上 FedProx 近端项

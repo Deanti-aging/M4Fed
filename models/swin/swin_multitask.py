@@ -122,7 +122,7 @@ def _load_swinunetr_backbone(
         from monai.networks.nets import SwinUNETR
 
         full_model = SwinUNETR(
-            img_size=img_size,
+            # monai>=1.5 移除了 img_size 参数：SwinUNETR 改为在 forward 时动态推断输入尺寸
             in_channels=1,
             out_channels=2,            # 解码器不使用，取最小值
             feature_size=feature_size,
@@ -168,7 +168,7 @@ def _create_swinunetr_random(
         from monai.networks.nets import SwinUNETR
 
         full_model = SwinUNETR(
-            img_size=img_size,
+            # monai>=1.5 移除了 img_size 参数：SwinUNETR 改为在 forward 时动态推断输入尺寸
             in_channels=1,
             out_channels=2,
             feature_size=feature_size,

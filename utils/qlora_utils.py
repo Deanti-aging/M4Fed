@@ -47,7 +47,13 @@ def apply_qlora(
       添加 LoRA 适配器后的模型（基础权重已冻结）
     """
     try:
-        from peft import get_peft_model, LoraConfig, TaskType  # 导入 PEFT（Parameter-Efficient Fine-Tuning）库
+        from peft import get_peft_model, LoraConfig, TaskType, PeftModel  # 导入 PEFT（Parameter-Efficient Fine-Tuning）库
+        if isinstance(model, PeftModel):
+            # 模型已被 apply_qlora 包裹过一次（如联邦循环中同一 client 的 medmd.unet
+            # 每轮都重新构造 MedMDTrainer 并再次调用本函数）：先 unload() 还原出原始
+            # nn.Linear 层，否则第二次 get_peft_model 会在已被替换成 lora.Linear 的
+            # 模块上找不到任何可包裹的目标层，报 "No modules were targeted for adaptation"
+            model = model.unload()
         try:
             from peft import prepare_model_for_kbit_training   # 用于 k-bit 量化预处理
             import bitsandbytes                                  # 4-bit 量化支持库（需要 CUDA）
@@ -115,6 +121,11 @@ def _find_linear_names(model: nn.Module, max_names: int = 10) -> List[str]:
     for name, module in model.named_modules():         # 遍历所有子模块（递归展开）
         if isinstance(module, nn.Linear):              # 只关注全连接（线性）层
             part = name.split(".")[-1]                 # 取路径最后一段（例如 "block.0.attn.to_q" 取 "to_q"）
+            # 纯数字后缀（如 nn.Sequential 内 Linear 的索引 "0"/"2"）跳过：
+            # PEFT 按名称后缀匹配 target_modules，纯数字极易和模型中其他容器的
+            # ModuleList 索引（如 down_blocks.0）撞名，导致误把非 Linear 容器当作目标层
+            if part.isdigit():
+                continue
             if part not in names:                      # 避免重复收集相同名称
                 names.append(part)                     # 加入收集列表
         if len(names) >= max_names:                    # 达到上限后停止遍历，避免目标层过多

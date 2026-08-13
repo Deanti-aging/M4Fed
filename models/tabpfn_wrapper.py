@@ -49,8 +49,9 @@ class TabPFNImputer:
             return   # 已经尝试过加载（成功或失败），不再重复尝试
         try:
             from tabpfn import TabPFNClassifier, TabPFNRegressor   # 导入 TabPFN 库
-            self._clf = TabPFNClassifier(device=self.device, seed=self.seed)  # 分类器（用于类别字段）
-            self._reg = TabPFNRegressor(device=self.device, seed=self.seed)   # 回归器（用于连续字段）
+            # 新版 tabpfn（>=2.5）构造函数参数名为 random_state，不再是 seed
+            self._clf = TabPFNClassifier(device=self.device, random_state=self.seed)  # 分类器（用于类别字段）
+            self._reg = TabPFNRegressor(device=self.device, random_state=self.seed)   # 回归器（用于连续字段）
             self._tabpfn = True   # 标记加载成功
         except Exception as e:
             # TabPFN 库未安装或版本不兼容，退回简单统计填充

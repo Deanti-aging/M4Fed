@@ -1,2 +1,10 @@
 # MRI 缓存数据（体积过大，不纳入版本控制）
 data/mri_cache/
+
+# 本地密钥/token（如 TABPFN_TOKEN），绝不纳入版本控制
+.env.local
+
+# Python 字节码缓存（自动生成，与环境绑定，不纳入版本控制）
+__pycache__/
+*.pyc
+*.pyo

@@ -249,7 +249,7 @@ def _build_monai_unet(cfg) -> nn.Module:
             in_channels=cfg.unet_in_channels,             # 输入通道数 = VAE latent_channels
             out_channels=cfg.unet_out_channels,           # 输出通道数 = 噪声预测通道数
             num_res_blocks=cfg.unet_num_res_blocks,       # 每个分辨率级别的残差块数
-            num_channels=cfg.unet_num_channels,           # 各级别的特征通道数（升序）
+            channels=cfg.unet_num_channels,               # 各级别的特征通道数（升序，monai>=1.5 参数名由 num_channels 改为 channels）
             attention_levels=cfg.unet_attention_levels,   # 哪些级别启用自注意力
             norm_num_groups=cfg.unet_norm_num_groups,     # GroupNorm 的组数
             with_conditioning=True,                        # 启用交叉注意力（接受文本条件）
@@ -309,6 +309,23 @@ class MedMD(nn.Module):
             repo_id=model_cfg.biomedclip_repo,  # BioMedCLIP 模型的 HuggingFace 仓库 ID
             device=device,                       # 目标设备
         )
+        # 文本条件投影：BioMedCLIP 隐藏维度固定（PubMedBERT 为 768，与 unet_cross_attention_dim
+        # 的默认值不一致），此处解耦二者，使 cross_attention_dim 可自由配置（如冒烟测试为提速
+        # 使用更小的值）而无需依赖文本编码器的具体输出维度。
+        # 该投影不参与训练（与 text_encoder 一样冻结），并用独立于全局随机数状态的局部生成器
+        # 初始化，保证所有客户端/服务器上构造出的投影矩阵完全一致——U-Net 权重在节点间共享/
+        # 聚合，若各节点的投影矩阵不同会导致同一份 U-Net 权重在不同节点上对应不一致的条件编码。
+        self.context_proj = nn.Linear(
+            self.text_encoder.hidden_dim, model_cfg.unet_cross_attention_dim, bias=False
+        )
+        with torch.no_grad():
+            gen = torch.Generator().manual_seed(20260408)
+            self.context_proj.weight.copy_(
+                torch.empty_like(self.context_proj.weight).normal_(generator=gen)
+                / (self.text_encoder.hidden_dim ** 0.5)
+            )
+        self.context_proj.requires_grad_(False)
+        self.context_proj = self.context_proj.to(device)
 
         # ---- 可训练组件（U-Net 参与联邦训练） ----
         # U-Net：在潜空间中预测去噪方向 ε_θ(z_t, t, c)
@@ -360,9 +377,11 @@ class MedMD(nn.Module):
         # 前向加噪：将 z₀ 加噪到随机时间步 t 处（重参数化技巧，一步直达）
         z_t, eps = self.scheduler.add_noise(z0, t)   # eps 是实际添加的噪声（训练标签）
 
-        # 文本条件：用冻结文本编码器将文本列表转为交叉注意力条件向量
+        # 文本条件：用冻结文本编码器将文本列表转为交叉注意力条件向量，再投影到 U-Net 的
+        # cross_attention_dim
         with torch.no_grad():
             context = self.text_encoder(texts)   # (B, L, D_clip)，L=77（CLIP 序列长度）
+            context = self.context_proj(context)  # (B, L, cross_attention_dim)
 
         # U-Net 前向传播：预测加到 z₀ 上的噪声 ε（条件：时间步 t + 文本 c）
         eps_pred = self.unet(z_t, t, context)   # (B, lat_ch, d, h, w)
@@ -410,8 +429,9 @@ class MedMD(nn.Module):
                               dtype=torch.long, device=z0.device)
         z_t, _ = self.scheduler.add_noise(z0, t_tensor)   # 将 z₀ 加噪到 t_start 处
 
-        # 文本条件：将目标元数据文本编码为交叉注意力向量
+        # 文本条件：将目标元数据文本编码为交叉注意力向量，再投影到 U-Net 的 cross_attention_dim
         context = self.text_encoder(texts)   # (B, L, D_clip)
+        context = self.context_proj(context)  # (B, L, cross_attention_dim)
 
         # DDIM 去噪迭代：从 t_start 均匀减小到 0（条件去噪）
         timesteps = self.scheduler.get_timesteps_for_strength(noise_strength, ddim_steps)
@@ -471,9 +491,10 @@ class MedMD(nn.Module):
         z = torch.randn(batch_size, lat_ch, lat_d, lat_h, lat_w,
                         device=next(self.unet.parameters()).device)   # 与 U-Net 在同一设备
 
-        # 构造文本条件：批内所有样本使用同一年龄标签
+        # 构造文本条件：批内所有样本使用同一年龄标签，再投影到 U-Net 的 cross_attention_dim
         texts = [f"age is {age_label}"] * batch_size
         context = self.text_encoder(texts)   # (B, L, D_clip)
+        context = self.context_proj(context)  # (B, L, cross_attention_dim)
 
         # 从 T-1 开始完整去噪（生成模式，而非 img2img 的部分去噪）
         # linspace 从 T-1 到 0，共 ddim_steps 步（等间隔采样时间步）
