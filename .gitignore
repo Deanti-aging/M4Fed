@@ -1,6 +1,9 @@
 # MRI 缓存数据（体积过大，不纳入版本控制）
 data/mri_cache/
 
+# 预训练模型下载缓存（HuggingFace Hub / torch.hub，体积过大，不纳入版本控制）
+data/model_cache/
+
 # 本地密钥/token（如 TABPFN_TOKEN），绝不纳入版本控制
 .env.local
 
@@ -8,3 +11,9 @@ data/mri_cache/
 __pycache__/
 *.pyc
 *.pyo
+
+# LaTeX 写作文件夹（本地使用，不纳入版本控制）
+latex/
+
+# 训练/测试结果输出（含模型 checkpoint 等大文件，体积过大且属于运行产物，不纳入版本控制）
+results/

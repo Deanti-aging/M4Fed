@@ -37,7 +37,7 @@ from .preprocessing import preprocess_mri, preprocess_table   # MRI 和表格预
 from .table_to_text import table_row_to_text                   # 表格行 → 自然语言描述
 from .splits import assign_ds_splits, train_test_split_indices  # 数据集划分函数
 from utils.timing_utils import time_block, record_timing        # 耗时计时工具
-from utils.data_quality_utils import record_unusable_sample     # 不可用样本统计工具
+from utils.data_quality_utils import record_unusable_sample, load_known_unusable  # 不可用样本统计/持久化清单工具
 
 
 # =========================================================================== #
@@ -660,6 +660,9 @@ def make_openmind_sample_loader(
                               （不泄露扫描设备/文件路径等技术字段，用于文本条件）
       'age'                 : 年龄标签（float 或 None）
       'metadata'            : 完整的 pd.Series 行（含扫描技术字段，供偏差分析使用）
+      '_unusable'           : 命中 data/known_unusable_samples.csv 持久化清单时为 True
+                              （见 utils.data_quality_utils.load_known_unusable），
+                              OpenMindDataset._load_mri 会直接跳过下载
 
     参数：
       cache_dir    : 元数据 CSV 与惰性下载的 NIfTI 文件的本地存放根目录；
@@ -679,6 +682,11 @@ def make_openmind_sample_loader(
     # 该目录以仓库名同名（如 "AnonRes/OpenMind" 仓库下实际存放于 "OpenMind/ds000001/..."），
     # 需要拼接该前缀才能作为 hf_hub_download 的 filename 使用
     _repo_data_prefix = repo_id.split("/")[-1]
+
+    # 项目内持久化记录的已知不可用样本（data/known_unusable_samples.csv，随 git 提交）。
+    # 只加载一次（O(1) 查询），供下面的 _sample_loader_fn 在构建样本字典时直接标记
+    # _unusable=True，跳过一次已确认会失败的下载尝试
+    known_unusable = load_known_unusable()
 
     # 对 _CATEGORICAL_PRED_FIELDS 中的类别型字段拟合标签编码映射
     # 在全量 df 上统计所有可能取值，保证编码跨子数据集一致
@@ -727,6 +735,10 @@ def make_openmind_sample_loader(
                 "age": float(age),   # 已确认非 NaN，直接转 float
                 "metadata": row,                                # 完整行（含扫描设备信息，供偏差分析）
             }
+            # 命中持久化的已知不可用清单：直接标记，OpenMindDataset._load_mri 会在
+            # 第一步短路跳过，不再重新触发一次已确认损坏的下载
+            if sample["hf_image_path"] in known_unusable:
+                sample["_unusable"] = True
             # 编码类别型预测字段（health_status、race 等）为整数索引
             # 未知或缺失值编码为 NaN，compute_loss 中的 NaN mask 会自动忽略
             for field in _CATEGORICAL_PRED_FIELDS:

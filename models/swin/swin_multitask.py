@@ -19,6 +19,7 @@ SwinUNETR 多任务预测模型：骨干网络 + 多个任务头。
 """
 from __future__ import annotations
 import copy
+import os
 import torch
 import torch.nn as nn
 from typing import Dict, List, Optional, Tuple
@@ -130,8 +131,11 @@ def _load_swinunetr_backbone(
         )
 
         if pretrain_url:
+            from utils.env_utils import MODEL_CACHE_DIR   # 预训练模型统一缓存目录（项目内 data/model_cache）
+
             state = torch.hub.load_state_dict_from_url(
                 pretrain_url, map_location="cpu", check_hash=False,
+                model_dir=os.path.join(MODEL_CACHE_DIR, "torch", "hub", "checkpoints"),
             )
             raw = state.get("state_dict", state)
             # checkpoint 由 DataParallel 保存，去除 "module." 前缀后再载入

@@ -48,7 +48,7 @@ class DataConfig:
     # 惰性下载的 NIfTI 文件在本地磁盘上允许占用的总空间上限（GiB）
     # 超过该上限时 _LRUDiskCache 按最久未访问优先淘汰旧文件（LRU 策略）
     # 设为 0 或负数表示不限制（不建议在磁盘紧张的机器上使用）
-    max_cache_gb: float = 50.0
+    max_cache_gb: float = 80.0
     # 本地 openneuro_metadata.csv 的文件路径
     # 优先从此文件读取子数据集 ID（覆盖全量 800 个 ds_id，无需 HuggingFace API 请求）
     # 留空 "" 时退回通过 HuggingFace 元数据接口获取

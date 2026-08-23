@@ -98,7 +98,9 @@ def load_vae(
                 weight_path = hf_hub_download(
                     repo_id=repo_id,                                # HuggingFace 仓库 ID
                     filename="models/model_autoencoder.pt",          # 仓库中的权重文件路径
-                    cache_dir=None,                                  # 使用默认缓存目录（~/.cache/huggingface）
+                    # cache_dir=None：使用 HF_HOME 指向的缓存目录（见 utils/env_utils.py
+                    # 的 _setup_model_cache_dir，已重定向到项目内 data/model_cache/huggingface）
+                    cache_dir=None,
                 )
                 state = torch.load(weight_path, map_location="cpu", weights_only=True)  # 加载到 CPU
                 state = _remap_legacy_keys(state, vae.state_dict())  # 兼容旧版 monai-generative 的子模块命名

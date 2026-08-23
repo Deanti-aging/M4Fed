@@ -12,6 +12,9 @@ M4Fed 统一命令行入口。
   python main.py --mode ablation    --config configs/m4fed.yaml
   python main.py --mode sensitivity --config configs/m4fed.yaml
   python main.py --mode cross_site  --config configs/m4fed.yaml
+
+  # 生成样本可视化（独立实验，依赖 run_all 训练出的 FAN/M4Fed 权重，需先跑完 run_all）：
+  python main.py --mode visualize   --config configs/m4fed.yaml --results_dir results/main
 """
 from __future__ import annotations    # 允许注解中使用尚未定义的类名
 import argparse                       # 命令行参数解析（标准库）
@@ -33,14 +36,14 @@ def parse_args():
     解析命令行参数，返回 Namespace 对象。
 
     可用参数：
-      --mode       : 实验模式（test/run_all/ablation/sensitivity/cross_site）
+      --mode       : 实验模式（test/run_all/ablation/sensitivity/cross_site/visualize）
       --config     : YAML 配置文件路径（不存在时退回默认配置）
       --results_dir: 结果保存目录（自动创建）
     """
     p = argparse.ArgumentParser(description="M4Fed 联邦学习框架")
     # --mode：选择要执行的实验模式
     p.add_argument("--mode", choices=["run_all", "test", "ablation",
-                                       "sensitivity", "cross_site"],
+                                       "sensitivity", "cross_site", "visualize"],
                    default="test",              # 默认运行单元测试
                    help="要运行的实验类型")
     # --config：YAML 配置文件路径（支持相对路径）
@@ -62,6 +65,8 @@ def main():
       - ablation   : 调用 experiments/ablation.run_ablation()
       - sensitivity: 调用 experiments/sensitivity.run_sensitivity()
       - cross_site : 调用 experiments/cross_site.run_cross_site()
+      - visualize  : 调用 evaluation/generative_eval.visualize_fan_and_m4fed_samples()
+                     （独立实验，依赖 run_all 训练出的 FAN/M4Fed 权重）
     """
     args = parse_args()   # 解析命令行参数
 
@@ -79,7 +84,9 @@ def main():
     set_seed(cfg.training.seed)
 
     mri_shape = tuple(cfg.data.mri_shape)   # 目标 MRI 分辨率（如 (96, 96, 96)）
-    all_ds_ids = _load_ds_ids(cfg)          # 调用 HuggingFace API 列出真实 ID
+    # visualize 模式只读取已训练好的 FAN/M4Fed 权重做生成可视化，不需要数据集 ID 列表，
+    # 跳过该 HuggingFace API 调用可避免不必要的网络依赖
+    all_ds_ids = None if args.mode == "visualize" else _load_ds_ids(cfg)
 
     # 确保结果根目录存在（exist_ok=True：目录已存在时不报错）
     os.makedirs(args.results_dir, exist_ok=True)
@@ -96,6 +103,16 @@ def main():
         result = subprocess.run([sys.executable, "tests/unit_test.py"],
                                 capture_output=False)
         sys.exit(result.returncode)   # 透传退出码（0=通过，非0=失败）
+
+    elif args.mode == "visualize":
+        # 独立的生成样本可视化实验：加载 run_all（--mode run_all）留下的 FAN（client_0）
+        # 与 M4Fed（server）已训练完成的生成模型，各随机生成一个 3D MRI 并保存 2D 切片。
+        # 权重文件不存在时（尚未跑过 run_all，或该次 run_all 未训练该方法）会跳过对应
+        # 方法并打印提示，不影响退出码。--results_dir 需与对应 run_all 一致。
+        print("=== 运行生成样本可视化 ===")
+        from evaluation.generative_eval import visualize_fan_and_m4fed_samples
+        visualize_fan_and_m4fed_samples(cfg, args.results_dir, cfg.training.device, mri_shape=mri_shape)
+        return
 
     elif args.mode == "run_all":
         # 运行全部 5 个联邦学习基线（FedAvg/FedProx/FAN/GPT-FL/M4Fed），生成对比图表
@@ -178,13 +195,6 @@ def main():
     # 保存被判定为不可用而排除的样本清单（重新下载后仍损坏），用于统计真实数据可用率
     from utils.data_quality_utils import save_unusable_csv
     save_unusable_csv(os.path.join(args.results_dir, "unusable_samples.csv"))
-
-    # 可视化功能：加载 FAN（任一客户端，此处固定用 client_0）与 M4Fed（server）
-    # 已训练完成的生成模型，各随机生成一个 3D MRI 并保存 2D 切片。
-    # 权重文件不存在时（如本次只运行了 ablation/sensitivity/cross_site 等未训练该方法的模式）
-    # 会跳过对应方法并打印提示，不影响主流程。
-    from evaluation.generative_eval import visualize_fan_and_m4fed_samples
-    visualize_fan_and_m4fed_samples(cfg, args.results_dir, cfg.training.device, mri_shape=mri_shape)
 
 
 def _load_ds_ids(cfg) -> list:

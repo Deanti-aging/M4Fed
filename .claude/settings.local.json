@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile configs/base_config.py)",
+      "Bash(python -m py_compile data/openmind_dataset.py)",
+      "Bash(python -m py_compile models/medmd/medmd.py)",
+      "Bash(python -m py_compile models/neurofm/neurofm_multitask.py)",
+      "Bash(python -m py_compile federated/methods/m4fed.py)"
+    ]
+  }
+}

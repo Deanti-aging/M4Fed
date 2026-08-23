@@ -42,7 +42,8 @@ def _setup_font() -> None:
     plt.rcParams["font.family"] = "sans-serif"   # 所有候选字体均不可用时退回系统默认
 
 
-def save_figure(fig: plt.Figure, path: str, fmt: str = "svg", dpi: int = 300) -> None:
+def save_figure(fig: plt.Figure, path: str, fmt: str = "svg", dpi: int = 300,
+                 pad_inches: float = 0.1) -> None:
     """
     保存图表到文件并关闭 figure（释放内存）。
 
@@ -50,15 +51,16 @@ def save_figure(fig: plt.Figure, path: str, fmt: str = "svg", dpi: int = 300) ->
     dpi=300 适合论文印刷质量（300 DPI 是 IEEE/Springer 等期刊的标准要求）。
 
     参数：
-      fig  : 待保存的 matplotlib Figure 对象
-      path : 保存路径（不含扩展名时自动追加 .{fmt}）
-      fmt  : 文件格式（默认 "svg"，亦支持 "pdf"、"png"）
-      dpi  : 分辨率（像素/英寸，矢量格式 svg/pdf 时此参数无效）
+      fig        : 待保存的 matplotlib Figure 对象
+      path       : 保存路径（不含扩展名时自动追加 .{fmt}）
+      fmt        : 文件格式（默认 "svg"，亦支持 "pdf"、"png"）
+      dpi        : 分辨率（像素/英寸，矢量格式 svg/pdf 时此参数无效）
+      pad_inches : bbox_inches="tight" 裁剪后保留的外边距（紧凑网格图传 0 以彻底无边距）
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)   # 自动创建父目录
     if not path.endswith(f".{fmt}"):
         path = f"{path}.{fmt}"   # 自动追加文件扩展名
-    fig.savefig(path, format=fmt, dpi=dpi, bbox_inches="tight")   # 保存（tight 避免标签被裁剪）
+    fig.savefig(path, format=fmt, dpi=dpi, bbox_inches="tight", pad_inches=pad_inches)
     plt.close(fig)   # 关闭 figure 释放内存（批量保存时避免内存溢出）
 
 
@@ -310,26 +312,25 @@ def plot_error_heatmap(
 
 
 # --------------------------------------------------------------------------- #
-#  3D MRI 体积可视化：正中三视图 2D 切片                                          #
+#  3D MRI 体积可视化：正中三视图 2D 切片 / 多样本紧凑网格                            #
 # --------------------------------------------------------------------------- #
 
 def plot_mri_slices(
     volume: np.ndarray,                 # 3D MRI 体积，形状 (D, H, W) 或 (1, D, H, W)
     save_path: str,                     # 保存路径（不含扩展名时自动追加）
     fmt: str = "png",                   # 保存格式（默认 "png"，图像类内容不适合矢量格式）
-    title: Optional[str] = None,        # 图表总标题（如模型/方法名）
 ) -> plt.Figure:
     """
-    保存 3D MRI 体积的正中三视图（轴状/冠状/矢状）2D 切片图。
+    保存单个 3D MRI 体积的正中三视图（轴状/冠状/矢状）2D 切片图，图中不含任何文字。
 
     分别沿深度/高度/宽度三个轴取正中间的一张 2D 切片，用灰度图并排展示，
     三张切片共享同一灰度范围（体积的全局 min/max），便于直观比较。
+    方法名、条件（如年龄）等元信息应体现在 save_path 的文件名中。
 
     参数：
       volume    : 3D MRI 体积数组，值域通常为 [-1, 1]（preprocess_mri 处理后）
       save_path : 保存路径
       fmt       : 图片格式（"png"、"jpg" 等，非矢量格式）
-      title     : 可选的图表总标题
 
     返回：
       matplotlib Figure 对象
@@ -340,19 +341,80 @@ def plot_mri_slices(
         vol = vol[0]
     d, h, w = vol.shape
     slices = [vol[d // 2, :, :], vol[:, h // 2, :], vol[:, :, w // 2]]   # 正中三个切面
-    names = ["Axial", "Coronal", "Sagittal"]
     vmin, vmax = float(vol.min()), float(vol.max())   # 三张切片共享灰度范围，便于比较
 
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    for ax, sl, name in zip(axes, slices, names):
+    for ax, sl in zip(axes, slices):
         ax.imshow(sl, cmap="gray", vmin=vmin, vmax=vmax)   # 灰度显示 MRI 切片
-        ax.set_title(name, fontsize=11)
         ax.axis("off")   # 隐藏坐标轴（图像类展示不需要）
-    if title:
-        fig.suptitle(title, fontsize=12)
-    fig.tight_layout()
+    fig.subplots_adjust(wspace=0.02, hspace=0)
     save_figure(fig, save_path, fmt=fmt)
     return fig
+
+
+def plot_mri_grid(
+    volumes: List[np.ndarray],          # 多个 3D MRI 体积列表，每个形状 (D, H, W) 或 (1, D, H, W)
+    save_path_prefix: str,              # 保存路径前缀（不含扩展名），视图名会作为后缀追加
+    fmt: str = "png",                   # 保存格式（默认 "png"）
+    n_rows: int = 3,                    # 网格行数
+    n_cols: int = 4,                    # 网格列数
+) -> Dict[str, str]:
+    """
+    将多个（默认 12 个）合成 3D MRI 体积按视图分别渲染为紧凑网格图。
+
+    对轴状/冠状/矢状三种视图各生成一张图，每张图为 n_rows × n_cols
+    （默认 3×4=12）子图紧凑排列（无间隙、无坐标轴、无标题等任何文字），
+    每个子图展示一个体积在该视图下正中切片。方法名、样本数等元信息
+    应体现在 save_path_prefix 对应的文件名中（本函数不在图中写入文字）。
+
+    参数：
+      volumes           : 体积列表，长度需等于 n_rows * n_cols
+      save_path_prefix  : 保存路径前缀，实际文件名为
+                           "{save_path_prefix}_{view}.{fmt}"，view 取值
+                           "axial" / "coronal" / "sagittal"
+      fmt               : 图片格式
+      n_rows, n_cols     : 网格行列数（默认 3 行 4 列，共 12 个子图）
+
+    返回：
+      {视图名: 保存路径} 字典
+    """
+    _setup_font()   # 设置字体
+    n_total = n_rows * n_cols
+    if len(volumes) != n_total:
+        raise ValueError(f"volumes 长度需为 {n_total}（{n_rows}x{n_cols}），实际为 {len(volumes)}")
+
+    vols = []
+    for v in volumes:
+        v = np.asarray(v)
+        if v.ndim == 4:   # (1, D, H, W) → (D, H, W)：去掉通道维
+            v = v[0]
+        vols.append(v)
+
+    view_slicers = {
+        "axial": lambda v: v[v.shape[0] // 2, :, :],
+        "coronal": lambda v: v[:, v.shape[1] // 2, :],
+        "sagittal": lambda v: v[:, :, v.shape[2] // 2],
+    }
+
+    saved_paths = {}
+    for view_name, slicer in view_slicers.items():
+        slices = [slicer(v) for v in vols]
+        vmin = min(float(s.min()) for s in slices)   # 全部 12 张切片共享灰度范围
+        vmax = max(float(s.max()) for s in slices)
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2.5, n_rows * 2.5))
+        for ax, sl in zip(axes.ravel(), slices):
+            ax.imshow(sl, cmap="gray", vmin=vmin, vmax=vmax)   # 灰度显示
+            ax.axis("off")
+            ax.set_xticks([])
+            ax.set_yticks([])
+        # 子图之间无间隙、无边距，彼此紧凑相邻
+        fig.subplots_adjust(wspace=0, hspace=0, left=0, right=1, top=1, bottom=0)
+
+        path = f"{save_path_prefix}_{view_name}"
+        save_figure(fig, path, fmt=fmt, pad_inches=0)
+        saved_paths[view_name] = path if path.endswith(f".{fmt}") else f"{path}.{fmt}"
+    return saved_paths
 
 
 # --------------------------------------------------------------------------- #
