@@ -13,6 +13,7 @@ def assign_ds_splits(
     seed: int = 42,
     quality_stats: Optional[Dict[str, Dict[str, float]]] = None,
     max_missing_ratio: float = 0.5,
+    n_public_max: Optional[int] = None,
 ) -> Dict[str, List[str]]:
     """
     将所有子数据集 ID 随机分配到以下角色（各角色之间互不重叠）：
@@ -21,13 +22,14 @@ def assign_ds_splits(
       'server_private'      : 服务器私有数据集
       'client_0_private'    : 客户端 0 的私有数据集
       'client_1_private'    : 客户端 1 的私有数据集（以此类推）
-      'public'              : 剩余全部数据集，作为服务器的公开数据用于 MedMD 热身预训练
+      'public'              : 服务器公开数据集（用于 MedMD 热身预训练），取剩余池的前
+                              n_public_max 个（n_public_max 为 None 时取剩余全部）
 
     分配顺序（先到先得，按 pool 剩余量分配）：
       1. 从随机打乱的池中依次挑选 n_cross 个 -> cross
          （若提供 quality_stats，跳过不达标的 ID，留给私有/公开角色；见下）
       2. 取接下来 n_private_per_node * (1 + n_clients) 个 -> 私有（服务器 + 各客户端）
-      3. 剩余全部 -> public
+      3. 剩余中的前 n_public_max 个（不传则为剩余全部）-> public
 
     注意：数据质量预筛选（年龄非空率检查，即完全排除全空数据集）应在调用此函数之前完成，
     本函数默认只负责随机分配，不做质量过滤。
@@ -49,6 +51,8 @@ def assign_ds_splits(
       seed               : 随机种子（保证可复现性）
       quality_stats      : 可选，{ds_id: {field: missing_ratio}}，用于筛选 cross 候选
       max_missing_ratio  : quality_stats 各字段缺失率的最大允许值（默认 0.5，即 50%）
+      n_public_max       : public 角色的最大子数据集数量上限；为 None 时不设上限，
+                            取 cross/私有分配后剩余的全部子数据集
 
     返回：
       字典，键为角色名，值为对应的子数据集 ID 列表
@@ -99,7 +103,8 @@ def assign_ds_splits(
         start = n_private_per_node * (i + 1)                       # 第 i 个客户端的起始下标
         result[f"client_{i}_private"] = private_pool[start: start + n_private_per_node]  # 切片分配
 
-    result["public"] = pool   # 剩余全部数据集，磁盘空间由 LRU 缓存管理
+    # public 取剩余池的前 n_public_max 个（不设上限则为剩余全部），磁盘空间由 LRU 缓存管理
+    result["public"] = pool if n_public_max is None else pool[:n_public_max]
     return result   # 返回包含所有角色分配结果的字典
 
 

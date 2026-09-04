@@ -56,3 +56,4 @@ OpenMind/ds004261/sub-2062/ses-day1PM/anat/sub-2062_ses-day1PM_T1w.nii.gz,重新
 OpenMind/ds003763/sub-15199/anat/sub-15199_T1w.nii.gz,重新下载后仍损坏: Compressed file ended before the end-of-stream marker was reached
 OpenMind/ds003097/sub-0255/anat/sub-0255_run-2_T1w.nii.gz,重新下载后仍损坏: Compressed file ended before the end-of-stream marker was reached
 OpenMind/ds004406/sub-25/ses-01/anat/sub-25_ses-01_T1w.nii.gz,重新下载后仍损坏: Compressed file ended before the end-of-stream marker was reached
+OpenMind/ds003848/sub-RESP0779/ses-1/anat/sub-RESP0779_ses-1_rec-deface_T1w.nii,体素含 NaN/Inf

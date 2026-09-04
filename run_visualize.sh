@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=m4fed_visualize
-#SBATCH --partition=ada_gpu
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --clusters=hydra
+#SBATCH --partition=ampere_gpu,hopper_gpu
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=01:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --output=results/main/slurm_visualize_%j.log
 source ~/.bashrc
 conda activate m4fed

@@ -2,9 +2,9 @@ experiment_name: "fan"
 federated:
   method: "fan"
   n_clients: 3
-  warm_rounds: 5
-  federated_rounds: 50
-  local_rounds: 50
+  warm_rounds: 1
+  federated_rounds: 3
+  local_rounds: 3
   synth_ratio_fed: 0.1
   synth_ratio_local: 1.0
 training:

@@ -122,7 +122,7 @@ M4Fed/
 ### Participants
 | Node | Data | Models |
 |------|------|--------|
-| Server | public + private (20 ds) | MedMD (pre-trained) + NeuroFM |
+| Server | public (20 ds, cap `n_public_ds_max`) + private (20 ds) | MedMD (pre-trained) + NeuroFM |
 | Client 1 | private (20 ds) | MedMD (copy) + NeuroFM |
 | Client 2 | private (20 ds) | MedMD (copy) + NeuroFM |
 
@@ -258,8 +258,8 @@ einops>=0.7
 | Parameter | Value |
 |-----------|-------|
 | `warm_rounds` | 5 |
-| `federated_rounds` | 10 |
-| `local_rounds` | 10 |
+| `federated_rounds` | 3 |
+| `local_rounds` | 3 |
 | `batch_size` | 1 |
 | `lr_medmd` | 1e-4 |
 | `lr_neurofm` | 5e-5 |
@@ -275,6 +275,7 @@ einops>=0.7
 | `train_split` | 0.9 |
 | `seed` | 42 |
 | `n_private_ds_per_node` | 20 |
+| `n_public_ds_max` | 20 |
 | `n_cross_ds` | 5 |
 
 ---

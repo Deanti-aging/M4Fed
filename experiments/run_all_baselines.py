@@ -161,6 +161,7 @@ def main():
         sample_loader_fn=sample_loader_fn,
         quality_stats=quality_stats,          # ds_id → {字段: 缺失率}，None 表示不过滤
         max_missing_ratio=cfg.data.cross_max_missing_ratio,
+        n_public_max=cfg.data.n_public_ds_max,  # server_public 数据集数量上限
         return_split_ids=True,
     )
     # cross 集合仅由 all_ds_ids/n_cross/seed/quality_stats 决定，与 n_clients 无关，
@@ -181,6 +182,7 @@ def main():
         sample_loader_fn=sample_loader_fn,
         quality_stats=quality_stats,
         max_missing_ratio=cfg.data.cross_max_missing_ratio,
+        n_public_max=cfg.data.n_public_ds_max,
     )
 
     # ------------------------------------------------------------------ #

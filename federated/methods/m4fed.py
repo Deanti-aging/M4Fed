@@ -326,22 +326,40 @@ def run_m4fed(
     _eval_t0 = time.perf_counter()   # 记录评估开始时间
     results = {}   # 存储所有节点的评估指标
 
-    def _eval_node(node_id, swin_model, test_loader):
+    def _eval_node(node_id, swin_model, test_loader, return_raw: bool = False):
         """评估单个节点的脑年龄预测性能（推理模式，不更新参数）。"""
         from training.swin_trainer import SwinTrainer as T
         trainer = T(swin_model, device=device, lr=0, mixed_precision=False)
         y_true, y_pred = trainer.evaluate(test_loader)
         if len(y_true) == 0:
-            return {"MAE": float("nan"), "RMSE": float("nan"),
-                    "Pearson_r": float("nan"), "R2": float("nan")}
-        return compute_domain_metrics(y_true, y_pred)
+            metrics = {"MAE": float("nan"), "RMSE": float("nan"),
+                       "Pearson_r": float("nan"), "R2": float("nan")}
+        else:
+            metrics = compute_domain_metrics(y_true, y_pred)
+        return (metrics, y_true, y_pred) if return_raw else metrics
 
-    results["server"] = _eval_node("server", server.swin, server.test_loader)
+    results["server"], server_y_true, server_y_pred = _eval_node(
+        "server", server.swin, server.test_loader, return_raw=True
+    )
     for c in clients:
         results[f"client_{c.client_id}"] = _eval_node(
             f"client_{c.client_id}", c.swin, c.test_loader
         )
     record_timing(f"{method}/eval", time.perf_counter() - _eval_t0)   # 记录评估耗时
+
+    # ---- 服务器 domain model 偏差分析（样本量比 cross_site 更大，分组统计更稳） ----
+    # test_loader（shuffle=False）与 private_datasets["test"].samples 顺序一致，
+    # 因此可以直接按下标对齐元数据。
+    if len(server_y_true) > 0:
+        server_metadata = [s.get("metadata", {}) for s in server.private_datasets["test"].samples]
+        server_bias = compute_bias_analysis(server_y_true, server_y_pred, server_metadata)
+        results["server_bias"] = server_bias
+        save_all_bias_figures(
+            server_bias, out,
+            method_name="m4fed_server",
+            metadata=server_metadata,
+            fmt=cfg.eval.figure_format,
+        )
 
     # 计算客户端指标的均值和标准差（用于与基线对比的汇总统计）
     client_keys = [f"client_{c.client_id}" for c in clients]

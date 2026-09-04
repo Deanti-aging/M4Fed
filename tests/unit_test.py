@@ -176,6 +176,7 @@ def _build_datasets(cfg, n_clients=2):
         mri_shape=MRI_SHAPE,
         seed=cfg.data.seed,
         sample_loader_fn=sample_fn,
+        n_public_max=cfg.data.n_public_ds_max,
     )
     return nd, sample_fn
 
@@ -319,7 +320,7 @@ def test_ablation():
     }
     res = run_ablation(_Args(), cfg, all_ids, MRI_SHAPE, task_specs, RESULTS_DIR)
     assert len(res) == 4
-    assert "health_subset_eval" in res["only_healthy_train"]
+    assert "health_subset_eval" in res["w/o_ill_train"]
     print("PASS")
 
 
@@ -376,7 +377,8 @@ def test_cross_site():
     cross_ds = nd["cross"]["all"]
     from experiments.cross_site import run_cross_site
     model_path = _find_baseline_swin_path()
-    res = run_cross_site(_Args(), cfg, cross_ds, RESULTS_DIR, model_path=model_path)
+    res = run_cross_site(_Args(), cfg, cross_ds, RESULTS_DIR, model_path=model_path,
+                         sample_loader_fn=sample_fn)
     assert "metrics" in res
     print("PASS")
 

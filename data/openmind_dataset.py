@@ -37,7 +37,9 @@ from .preprocessing import preprocess_mri, preprocess_table   # MRI 和表格预
 from .table_to_text import table_row_to_text                   # 表格行 → 自然语言描述
 from .splits import assign_ds_splits, train_test_split_indices  # 数据集划分函数
 from utils.timing_utils import time_block, record_timing        # 耗时计时工具
-from utils.data_quality_utils import record_unusable_sample, load_known_unusable  # 不可用样本统计/持久化清单工具
+from utils.data_quality_utils import (         # 不可用样本统计/持久化清单工具
+    record_unusable_sample, load_known_unusable, record_nan_sample,
+)
 
 
 # =========================================================================== #
@@ -268,6 +270,40 @@ class OpenMindDataset(Dataset):
         }
 
     # ---------------------------------------------------------------------- #
+    def _reject_if_non_finite(self, vol: np.ndarray, s: dict, mri_path: str) -> np.ndarray:
+        """
+        体素有限性检查：若体积中含 NaN/Inf，视为不可用样本并排除。
+
+        与"下载损坏"（gzip 流不完整）不同，NaN/Inf 情况下文件本身能正常解压/
+        读取，问题在数值内容本身（很可能是源数据集或 OpenMind 聚合流程自带的
+        缺陷），重新下载大概率拿到同一份内容，因此不删除本地缓存文件，只把该
+        样本标记永久不可用。
+
+        除了正常写入 data/known_unusable_samples.csv（下次运行跳过下载/加载），
+        还额外记入 data/known_nan_samples.csv，与其它排除原因区分开，方便事后
+        统计 NaN/Inf 样本占比。
+
+        参数：
+          vol      : nib.get_fdata() 返回的原始体积数组
+          s        : 样本字典（原地标记 s["_unusable"] = True）
+          mri_path : 本地缓存文件路径（无 hf_image_path 时用作 identifier）
+
+        返回：
+          vol 本身（体素全部有限时原样返回，供调用方直接 return）
+
+        抛出：
+          _UnusableSample : 体素含 NaN/Inf
+        """
+        if np.isfinite(vol).all():
+            return vol
+        identifier = s.get("hf_image_path") or mri_path
+        reason = "体素含 NaN/Inf"
+        s["_unusable"] = True
+        record_unusable_sample(identifier, reason)
+        record_nan_sample(identifier, reason)
+        print(f"[MRI] 体素含 NaN/Inf，视为不可用样本并排除: {identifier}")
+        raise _UnusableSample()
+
     def _load_mri(self, s: dict) -> np.ndarray:
         """
         按优先级加载 MRI 数据，返回原始体积数组（numpy ndarray, float32）。
@@ -311,7 +347,8 @@ class OpenMindDataset(Dataset):
                 raise ImportError("加载 NIfTI 文件需要安装 nibabel 库")
             try:
                 img = nib.load(mri_path)                 # 使用 nibabel 加载 NIfTI 文件
-                return img.get_fdata(dtype=np.float32)    # 返回 float32 体积数组
+                vol = img.get_fdata(dtype=np.float32)     # 读出 float32 体积数组
+                return self._reject_if_non_finite(vol, s, mri_path)  # 体素有限性检查
             except (EOFError, OSError) as e:
                 # 缓存文件损坏（如上次下载被中断，gzip 流不完整）：删除损坏文件，
                 # 若来自 HuggingFace 则重新下载一次；否则直接抛出，避免无限重试
@@ -324,7 +361,8 @@ class OpenMindDataset(Dataset):
                         # 的 blob 缓存（否则会直接复制同一份已损坏的缓存 blob，重试等于白重试）
                         mri_path = self._resolve_hf_path(s, force_download=True)
                         img = nib.load(mri_path)
-                        return img.get_fdata(dtype=np.float32)
+                        vol = img.get_fdata(dtype=np.float32)
+                        return self._reject_if_non_finite(vol, s, mri_path)  # 体素有限性检查
                     except (EOFError, OSError) as e2:
                         # 重新下载后仍然损坏：说明远端源文件本身就是坏的（而非本地缓存问题），
                         # 重试无法解决。标记该样本永久不可用并记录统计，交由 __getitem__
@@ -773,6 +811,7 @@ def build_node_datasets(
     sample_loader_fn=None,            # 可调用对象：ds_id → List[dict]（必须提供）
     quality_stats: Optional[Dict[str, Dict[str, float]]] = None,  # {ds_id: {field: missing_ratio}}，见 compute_ds_quality_stats
     max_missing_ratio: float = 0.5,   # quality_stats 各字段缺失率的最大允许值，透传给 assign_ds_splits
+    n_public_max: Optional[int] = None,  # server_public 的最大子数据集数量上限，透传给 assign_ds_splits
     return_split_ids: bool = False,   # True 时额外返回 assign_ds_splits 的角色→ds_id 分配结果
 ) -> Dict[str, Dict[str, "OpenMindDataset"]]:
     """
@@ -800,6 +839,7 @@ def build_node_datasets(
       quality_stats     : 可选，{ds_id: {field: missing_ratio}}（见 compute_ds_quality_stats），
                           用于在挑选 cross 数据集时按缺失率二次把关；不传则不做质量过滤
       max_missing_ratio : quality_stats 各字段缺失率的最大允许值（默认 0.5，即 50%）
+      n_public_max      : server_public 的最大子数据集数量上限；为 None 时不设上限，取剩余全部
       return_split_ids  : True 时返回 (result, split_ids) 二元组，split_ids 为
                           assign_ds_splits 的角色→ds_id 分配结果（供调用方记录 cross 用了哪些 ds_id）
     """
@@ -810,6 +850,7 @@ def build_node_datasets(
     split_ids = assign_ds_splits(
         all_ds_ids, n_cross, n_private_per_node, n_clients, seed,
         quality_stats=quality_stats, max_missing_ratio=max_missing_ratio,
+        n_public_max=n_public_max,
     )
 
     def _load_ds(ids: List[str]) -> List[dict]:

@@ -34,7 +34,7 @@ from utils.timing_utils import time_block                 # 代码块耗时计�
 
 
 def run_cross_site(args, cfg, cross_dataset: OpenMindDataset, results_dir: str,
-                   model_path: str = None) -> dict:
+                   model_path: str = None, sample_loader_fn=None) -> dict:
     """
     在跨站点数据集上评估服务器端 SwinMultiTask 的泛化性能。
 
@@ -53,6 +53,10 @@ def run_cross_site(args, cfg, cross_dataset: OpenMindDataset, results_dir: str,
       results_dir   : 结果保存根目录（cross_site/ 子目录将在此创建）
       model_path    : 已训练 SwinMultiTask 权重路径（.pt 文件）；
                       若为 None 或文件不存在，则使用随机初始化权重进行基线对照
+      sample_loader_fn : make_openmind_sample_loader 返回的样本加载闭包；
+                      用其 .n_classes 覆盖 task_specs 中的占位类别数，
+                      保证任务头结构与训练时（run_all_baselines）一致，
+                      否则 load_state_dict 会因 race/health_status 头形状不匹配而报错
 
     返回：
       {'metrics': 指标字典, 'bias': 偏差分析结果字典}
@@ -68,9 +72,16 @@ def run_cross_site(args, cfg, cross_dataset: OpenMindDataset, results_dir: str,
     task_specs = {
         "age":           {"type": "regression",     "n_classes": 1},
         "sex":           {"type": "classification", "n_classes": 2},
-        "health_status": {"type": "classification", "n_classes": 2},
-        "race":          {"type": "classification", "n_classes": 5},
+        "health_status": {"type": "classification", "n_classes": 2},  # 占位，n_classes 由数据决定
+        "race":          {"type": "classification", "n_classes": 5},  # 占位，n_classes 由数据决定
     }
+    # 用实际数据统计到的类别数覆盖占位值（与 run_all_baselines / ablation / sensitivity 一致）。
+    # 训练时 server_swin.pt 的 race/health_status 头就是按这个类别数构建的，
+    # 此处若不同步会导致 load_state_dict 形状不匹配（strict=False 也不放行形状差异）。
+    for field, n in getattr(sample_loader_fn, "n_classes", {}).items():
+        if field in task_specs and n > 0:
+            task_specs[field]["n_classes"] = n
+
     model = SwinMultiTask(
         pretrain_url=cfg.model.swinunetr_pretrain_url,   # MONAI SwinViT 预训练权重 URL
         img_size=tuple(cfg.data.mri_shape),              # 输入 MRI 空间尺寸
@@ -198,6 +209,7 @@ if __name__ == "__main__":
         sample_loader_fn=sample_loader_fn,       # 真实数据加载函数
         quality_stats=quality_stats,             # ds_id → {字段: 缺失率}，None 表示不过滤
         max_missing_ratio=cfg.data.cross_max_missing_ratio,
+        n_public_max=cfg.data.n_public_ds_max,   # server_public 数据集数量上限
         return_split_ids=True,
     )
     cross_samples = nd["cross"]["all"].samples   # 取出跨站点评估集的样本列表
@@ -212,4 +224,5 @@ if __name__ == "__main__":
     # 构建跨站点 OpenMindDataset（不做数据增强）
     cross_ds = OpenMindDataset(cross_samples, mri_shape)
     model_path = args.model_path or os.path.join(args.results_dir, "m4fed", "server_swin.pt")
-    run_cross_site(args, cfg, cross_ds, args.results_dir, model_path)
+    run_cross_site(args, cfg, cross_ds, args.results_dir, model_path,
+                   sample_loader_fn=sample_loader_fn)

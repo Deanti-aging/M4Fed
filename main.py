@@ -52,6 +52,10 @@ def parse_args():
     # --results_dir：所有结果的保存根目录（子实验会在此创建对应子目录）
     p.add_argument("--results_dir", default="results",
                    help="结果保存目录")
+    # --m4fed_results_dir：ablation 模式下变体 D 的 mixed_train_* 对照读取
+    # M4Fed 完整训练服务器模型（m4fed/server_swin.pt）的目录，默认指向 main 的输出
+    p.add_argument("--m4fed_results_dir", default="results/main",
+                   help="ablation 变体 D mixed_train_* 对照读取的 M4Fed 完整训练结果目录")
     return p.parse_args()   # 解析并返回命令行参数
 
 
@@ -171,6 +175,7 @@ def main():
             sample_loader_fn=sample_loader_fn,                   # 样本加载函数
             quality_stats=quality_stats,                         # ds_id → {字段: 缺失率}，None 表示不过滤
             max_missing_ratio=cfg.data.cross_max_missing_ratio,
+            n_public_max=cfg.data.n_public_ds_max,               # server_public 数据集数量上限
             return_split_ids=True,
         )
         # nd["cross"]["all"] 包含所有跨站点子数据集的样本（不分 train/test，全部用于评估）
@@ -183,7 +188,8 @@ def main():
               f"{os.path.join(cross_report_dir, 'cross_ds_ids.csv')}")
 
         model_path = os.path.join(args.results_dir, "m4fed", "server_swin.pt")
-        run_cross_site(args, cfg, cross_ds, args.results_dir, model_path)
+        run_cross_site(args, cfg, cross_ds, args.results_dir, model_path,
+                       sample_loader_fn=sample_loader_fn)
 
     # ------------------------------------------------------------------
     # 保存全局运行耗时分布（网络下载/各阶段训练/评估等）

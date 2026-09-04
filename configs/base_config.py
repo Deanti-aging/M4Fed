@@ -32,6 +32,10 @@ class DataConfig:
     n_cross_ds: int = 5
     # 每个节点（服务器 + 每个客户端）分配的私有子数据集数量
     n_private_ds_per_node: int = 20
+    # 服务器公开数据集（server_public）的最大子数据集数量上限
+    # 与 n_private_ds_per_node 保持一致（20），避免 public 取走 cross/private 分配后剩余的
+    # 全部子数据集，导致其规模不可控地随语料库总量增长、与其他节点的数据量失去可比性
+    n_public_ds_max: int = 20
     # 训练集占数据集的比例（如 0.9 = 90% 训练 + 10% 测试）
     # 仅作用于私有数据集（服务器私有 + 各客户端私有）；公开数据全量作训练，不划分测试集
     train_split: float = 0.9
@@ -132,11 +136,11 @@ class FederatedConfig:
     # 参与联邦训练的客户端数量（M4Fed 用 2 个，FedAvg/FedProx/FAN 用 3 个）
     n_clients: int = 2
     # 热身阶段轮数（服务器用公开数据预训练 MedMD，使 U-Net 具备基本扩散能力）
-    warm_rounds: int = 5
+    warm_rounds: int = 1
     # 联邦循环轮数（客户端↔服务器交换合成 MRI 数据并更新领域模型的轮数）
-    federated_rounds: int = 50
+    federated_rounds: int = 3
     # 本地训练阶段每个节点的训练轮数（Phase 3：使用合成 + 私有数据微调 SwinMultiTask）
-    local_rounds: int = 50
+    local_rounds: int = 3
     # 联邦循环阶段的合成数据比例（相对于本地私有数据量）
     # 0.1 = 合成 10% 的数据（较保守，避免联邦循环初期合成质量较低时引入噪声）
     synth_ratio_fed: float = 0.1

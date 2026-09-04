@@ -2,8 +2,8 @@ experiment_name: "fedprox"
 federated:
   method: "fedprox"
   n_clients: 3
-  federated_rounds: 50
-  local_rounds: 50
+  federated_rounds: 3
+  local_rounds: 3
   fedprox_mu: 0.001
 training:
   batch_size: 1

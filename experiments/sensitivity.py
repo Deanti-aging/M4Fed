@@ -3,11 +3,11 @@ M4Fed 敏感性分析（Sensitivity Analysis）。
 
 对三个关键超参数进行独立的网格搜索，每次仅改变一个变量，其余保持默认值：
 
-  1. 合成数据比例（synth_ratio）：[0.1, 1.0, 10.0]
+  1. 合成数据比例（synth_ratio）：[0.01, 0.1, 1.0]
      控制每轮联邦循环和本地训练中生成样本数与真实样本数的比值。
-     0.1 → 生成较少合成数据，10.0 → 生成 10 倍于真实数据的合成数据。
+     0.01 → 生成极少合成数据，1.0 → 生成与真实数据等量的合成数据。
 
-  2. MedMD 学习率（lr_medmd）：[1e-5, 1e-4, 1e-3]
+  2. MedMD 学习率（lr_medmd）：[1e-6, 1e-5, 1e-4]
      控制扩散模型 U-Net 的训练速度与收敛稳定性的平衡。
 
   3. 数据异质性（Dirichlet α）：[0.1, 0.5, 1.0]
@@ -87,6 +87,7 @@ def _base_datasets(cfg, all_ds_ids, mri_shape):
         mri_shape=mri_shape,                                 # MRI 目标分辨率
         seed=cfg.data.seed,                                  # 数据划分随机种子
         sample_loader_fn=sample_loader_fn,                   # 样本加载函数
+        n_public_max=cfg.data.n_public_ds_max,               # server_public 数据集数量上限
     )
     return nd, sample_loader_fn   # 同时返回 sample_loader_fn，供调用方获取 n_classes
 
@@ -187,11 +188,12 @@ def run_sensitivity(args, cfg, all_ds_ids, mri_shape, task_specs, results_dir):
     # 同时修改联邦循环阶段（synth_ratio_fed）和本地训练阶段（synth_ratio_local）
     # synth_ratio = 合成样本数 / 真实样本数（比值越大，合成数据影响越强）
     # ==================================================================
-    for ratio in [0.1, 1.0, 10.0]:   # 三个扫描点
+    for ratio in [0.01, 0.1, 1.0]:   # 三个扫描点
         tag = f"synth_ratio_{ratio}"  # 扫描点标签（用作目录名和结果键名）
         print(f"[敏感性] 合成比例 synth_ratio = {ratio}")
         set_seed(cfg.training.seed)     # 重置随机种子（每个扫描点独立初始化）
         cfg_r = copy.deepcopy(cfg)      # 深拷贝配置（避免修改原始配置）
+        cfg_r.eval.save_model = False   # 敏感性分析不保存权重 .pt（评估在内存模型上完成，见下方说明）
         cfg_r.federated.synth_ratio_fed = ratio    # 修改：联邦循环合成比例
         cfg_r.federated.synth_ratio_local = ratio  # 修改：本地训练合成比例
         nd = copy.deepcopy(nd_base)    # 深拷贝数据集（保证各扫描点数据独立）
@@ -210,11 +212,12 @@ def run_sensitivity(args, cfg, all_ds_ids, mri_shape, task_specs, results_dir):
     # 扫描 2：MedMD 学习率（lr_medmd）
     # 控制扩散模型 U-Net 的训练速度：学习率过大→不稳定，过小→收敛慢
     # ==================================================================
-    for lr in [1e-5, 1e-4, 1e-3]:   # 三个数量级
-        tag = f"lr_{lr:.0e}"          # 标签格式如 "lr_1e-05"
+    for lr in [1e-6, 1e-5, 1e-4]:   # 三个数量级
+        tag = f"lr_{lr:.0e}"          # 标签格式如 "lr_1e-06"
         print(f"[敏感性] 学习率 lr_medmd = {lr}")
         set_seed(cfg.training.seed)    # 重置随机种子
         cfg_l = copy.deepcopy(cfg)     # 深拷贝配置
+        cfg_l.eval.save_model = False  # 敏感性分析不保存权重 .pt
         cfg_l.training.lr_medmd = lr  # 修改：MedMD 扩散模型学习率
         nd = copy.deepcopy(nd_base)   # 深拷贝数据集
         s, c = _build(cfg_l, nd, device)   # 构建参与者
@@ -237,6 +240,7 @@ def run_sensitivity(args, cfg, all_ds_ids, mri_shape, task_specs, results_dir):
         print(f"[敏感性] 数据异质性 Dirichlet α = {alpha}")
         set_seed(cfg.training.seed)     # 重置随机种子（保证 M4Fed 训练可复现）
         cfg_d = copy.deepcopy(cfg)      # 深拷贝配置（α 不改变模型配置）
+        cfg_d.eval.save_model = False   # 敏感性分析不保存权重 .pt
         # 深拷贝数据集后按 Dirichlet(α) 重新划分各节点私有训练数据
         nd = dirichlet_resplit(copy.deepcopy(nd_base), alpha=alpha,
                                seed=cfg.training.seed)  # 使用与 M4Fed 相同的种子

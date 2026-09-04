@@ -2,8 +2,8 @@ experiment_name: "fedavg"
 federated:
   method: "fedavg"
   n_clients: 3
-  federated_rounds: 50
-  local_rounds: 50
+  federated_rounds: 3
+  local_rounds: 3
 training:
   batch_size: 1
   lr_neurofm: 5.0e-5

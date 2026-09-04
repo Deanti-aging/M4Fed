@@ -11,6 +11,10 @@
   构建样本时会读取这份清单，把已确认损坏的样本直接标记为 _unusable，
   跳过一次注定失败的下载尝试。results/.../unusable_samples.csv 由本模块的
   save_unusable_csv 导出，内容即该持久化清单（含本次运行新发现的部分）。
+
+  体素含 NaN/Inf 的样本额外单独记一份 data/known_nan_samples.csv（见
+  record_nan_sample），是 known_unusable_samples.csv 的子集，仅供事后统计
+  NaN/Inf 占比，不参与跳过逻辑。
 """
 from __future__ import annotations   # 允许注解中使用尚未定义的类名
 import csv                           # 标准库：CSV 文件读写
@@ -23,6 +27,13 @@ from typing import Dict, List, Tuple  # 类型注解工具
 # （utils/ 与 data/ 是项目根目录下的同级目录）
 DEFAULT_KNOWN_UNUSABLE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "data", "known_unusable_samples.csv"
+)
+
+# 持久化的"体素含 NaN/Inf 样本"清单路径：<项目根目录>/data/known_nan_samples.csv
+# 与 known_unusable_samples.csv 是同一批不可用样本的子集，单独记录一份纯粹是为了
+# 方便事后统计 NaN/Inf 占比（不参与加载跳过逻辑，跳过仍由 known_unusable_samples.csv 负责）
+DEFAULT_KNOWN_NAN_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "data", "known_nan_samples.csv"
 )
 
 
@@ -118,6 +129,24 @@ def record_unusable_sample(identifier: str, reason: str) -> None:
     供后续运行的 make_openmind_sample_loader 直接跳过下载。
     """
     _REGISTRY.add(identifier, reason)
+
+
+def record_nan_sample(identifier: str, reason: str) -> None:
+    """记录一条体素含 NaN/Inf 的样本，追加写入 data/known_nan_samples.csv。
+
+    与 record_unusable_sample 配合使用（该样本同时也会被记入
+    known_unusable_samples.csv 以便跳过加载）；这里单独存一份只是方便事后
+    用 `wc -l data/known_nan_samples.csv` 之类的方式统计 NaN/Inf 样本占比，
+    不影响任何跳过/加载行为，因此不需要跨运行去重或读回逻辑
+    （num_workers=0 单进程加载，见 make_dataloader，无需并发写锁）。
+    """
+    is_new_file = not os.path.exists(DEFAULT_KNOWN_NAN_PATH)
+    os.makedirs(os.path.dirname(DEFAULT_KNOWN_NAN_PATH) or ".", exist_ok=True)
+    with open(DEFAULT_KNOWN_NAN_PATH, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if is_new_file:
+            writer.writerow(["identifier", "reason"])
+        writer.writerow([identifier, reason])
 
 
 def save_unusable_csv(path: str) -> None:
