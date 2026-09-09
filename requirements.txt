@@ -11,9 +11,13 @@
 #     "已满足约束"而跳过安装，不会真的换成 GPU 版）。
 #     具体该用哪个 cuXXX 索引（cu124/cu128/...）以 https://pytorch.org/get-started/locally/
 #     页面为准，随显卡型号和驱动版本变化，此处不写死具体值。
-torch>=2.1.0
-torchvision>=0.16.0
-torchaudio>=2.1.0
+# 上限很重要：不设上限时 `pip install -r` 会拉到最新 torch（如 2.14.0+cu130，按 CUDA 13.0 编译），
+# 在只支持 CUDA 12.2 的旧驱动节点上会报 "NVIDIA driver on your system is too old"。
+# 集群 GPU 节点驱动为 CUDA 12.2，请用 cu121 wheel 安装：
+#   pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+torch>=2.1.0,<2.6
+torchvision>=0.16.0,<0.21
+torchaudio>=2.1.0,<2.6
 
 # ---- Medical imaging ----
 # 用到的仅是 monai.transforms（Compose/RandFlipd 等核心变换）、monai.networks.nets.SwinUNETR
@@ -22,6 +26,10 @@ torchaudio>=2.1.0
 # Windows 上缺少预编译 wheel，安装容易失败）。SwinUNETR 运行时真正需要的 einops 已在下方单独列出。
 # DiffusionModelUNet/AutoencoderKL 原来在独立的 monai-generative 仓库（最后更新 2024-01），
 # 自 monai 1.4.0 起已合并进核心包，故不再需要单独 `pip install git+...GenerativeModels.git`。
+# 注意：monai 1.6.0 的包元数据声明 torch>=2.8.0，与上面 torch<2.6 的钉法会让 pip 报一条
+# 依赖冲突 WARNING（非致命）。实测 monai 1.6.0 + torch 2.5.1 下本项目用到的
+# transforms / SwinUNETR / DiffusionModelUNet / AutoencoderKL 均可正常 import 和运行。
+# 若想彻底消除该 WARNING，可改钉 `monai>=1.4.0,<1.6`（1.5.x 元数据只要求 torch>=2.0）。
 monai>=1.4.0
 nibabel>=5.2.0
 nilearn>=0.10.3
