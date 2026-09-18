@@ -33,6 +33,10 @@ torchaudio>=2.1.0,<2.6
 monai>=1.4.0
 nibabel>=5.2.0
 nilearn>=0.10.3
+# 仅 experiments/healthy_subset_registered.py / register_healthy_subset_mri.py
+# （配准到 MNI152 标准模板的补充实验）用到，data/registration.py 里局部 import，
+# 不影响其它实验；nilearn 本身不含配准算法，只用它下载 MNI152 模板文件。
+SimpleITK>=2.3.0
 
 # ---- HuggingFace ----
 # transformers 已移除直接依赖：原用于加载 NeuroFM（TF 模型，与 PyTorch 不兼容），

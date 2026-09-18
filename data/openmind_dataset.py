@@ -184,6 +184,8 @@ class OpenMindDataset(Dataset):
         augment: bool = False,                    # 是否在 __getitem__ 时进行 3D 数据增强
         seed: int = 42,                           # 数据增强的随机种子
         augment_crop_ratio: float = 0.875,        # 随机裁剪保留的边长比例（相对 mri_shape）
+        register_to_template: bool = False,       # 是否先把 MRI 配准到 MNI152 标准模板
+        registered_cache_dir: Optional[str] = None,  # 配准结果磁盘缓存目录（None 用默认值）
     ):
         """
         参数：
@@ -192,6 +194,12 @@ class OpenMindDataset(Dataset):
           augment   : 是否在 __getitem__ 时进行 3D 数据增强（训练时开启，见 _build_augment_pipeline）
           seed      : 随机种子（传给 MONAI Compose 的 set_random_state，保证增强序列可复现）
           augment_crop_ratio : 随机裁剪的边长保留比例（裁剪后会插值回 mri_shape）
+          register_to_template : True 时在 preprocess_mri（裁剪/归一化/插值）之前，先把
+            MRI 仿射配准到 MNI152 标准模板空间（见 data.registration）。默认 False，
+            不影响现有实验（baseline / healthy_subset 等）。
+          registered_cache_dir : 配准结果的磁盘缓存目录。配准是整条流水线里最耗时的一步，
+            __getitem__ 会被反复调用（多个 local_rounds/epoch），必须落盘缓存复用，
+            默认使用 data.registration.DEFAULT_REGISTERED_CACHE_DIR。
 
         注意：augment=True 但环境中没有 MONAI 时直接抛 ImportError，
         而不是静默退化成"无增强"——后者会让实验结果与配置不符且无任何提示。
@@ -201,6 +209,9 @@ class OpenMindDataset(Dataset):
         self.augment = augment              # 数据增强开关
         self.seed = seed                    # 随机种子（供增强流水线使用）
         self.augment_crop_ratio = augment_crop_ratio   # 随机裁剪比例
+        self.register_to_template = register_to_template  # 配准开关
+        from .registration import DEFAULT_REGISTERED_CACHE_DIR
+        self.registered_cache_dir = registered_cache_dir or DEFAULT_REGISTERED_CACHE_DIR
         # 增强流水线只在 __init__ 构造一次：MONAI 随机变换的随机状态保存在变换对象内部，
         # 若每次 __getitem__ 重新构造，随机状态会被重置且 seed 完全失效
         self._aug = self._build_augment_pipeline() if augment else None
@@ -346,8 +357,7 @@ class OpenMindDataset(Dataset):
             if not HAS_NIBABEL:
                 raise ImportError("加载 NIfTI 文件需要安装 nibabel 库")
             try:
-                img = nib.load(mri_path)                 # 使用 nibabel 加载 NIfTI 文件
-                vol = img.get_fdata(dtype=np.float32)     # 读出 float32 体积数组
+                vol = self._read_volume(mri_path, s)      # 读取体积（含可选的模板配准）
                 return self._reject_if_non_finite(vol, s, mri_path)  # 体素有限性检查
             except (EOFError, OSError) as e:
                 # 缓存文件损坏（如上次下载被中断，gzip 流不完整）：删除损坏文件，
@@ -360,8 +370,7 @@ class OpenMindDataset(Dataset):
                         # force_download=True：跳过 huggingface_hub 自己按 ETag 判定“已下载完整”
                         # 的 blob 缓存（否则会直接复制同一份已损坏的缓存 blob，重试等于白重试）
                         mri_path = self._resolve_hf_path(s, force_download=True)
-                        img = nib.load(mri_path)
-                        vol = img.get_fdata(dtype=np.float32)
+                        vol = self._read_volume(mri_path, s)
                         return self._reject_if_non_finite(vol, s, mri_path)  # 体素有限性检查
                     except (EOFError, OSError) as e2:
                         # 重新下载后仍然损坏：说明远端源文件本身就是坏的（而非本地缓存问题），
@@ -378,6 +387,49 @@ class OpenMindDataset(Dataset):
 
         # 优先级 4（兜底）：返回随机噪声体积
         return np.random.randn(*self.mri_shape).astype(np.float32)
+
+    def _read_volume(self, mri_path: str, s: dict) -> np.ndarray:
+        """
+        读取 mri_path 对应的原始体积；register_to_template=True 时额外做模板配准。
+
+        register_to_template=False（默认，所有既有实验的行为）：
+          直接 nib.load(mri_path).get_fdata()，与改动前完全一致。
+
+        register_to_template=True：
+          1. 先查配准结果磁盘缓存（self.registered_cache_dir）——命中则直接返回，
+             不重复配准。配准（仿射，Mattes 互信息）单张约 10~30 秒，是整条流水线
+             里最耗时的一步，而 __getitem__ 会被同一批样本反复调用（多个
+             local_rounds/epoch），不缓存的话每次都要重新配准一遍。
+          2. 未命中则调用 data.registration.register_to_template 现场配准并写入
+             缓存（原子写：先写临时文件再 os.replace，避免并发/中断留下半截文件）。
+             正常流程下样本应已由 experiments/register_healthy_subset_mri.py
+             预先配准好，这里的现场配准只是兜底（如新发现的样本）。
+          3. 配准失败（如文件本身有问题导致 SimpleITK 报错）：仅在本次运行内把该
+             样本标记为不可用（不写入跨运行共享的 known_unusable_samples.csv——
+             配准失败是本预处理特有的问题，不代表该样本对其它实验也不可用）。
+        """
+        if not self.register_to_template:
+            return nib.load(mri_path).get_fdata(dtype=np.float32)
+
+        from .registration import register_to_template as _register, registered_cache_path
+        identifier = s.get("hf_image_path") or mri_path
+        cache_path = registered_cache_path(identifier, self.registered_cache_dir)
+        if os.path.exists(cache_path):
+            return np.load(cache_path)
+
+        try:
+            vol = _register(mri_path)
+        except Exception as e:
+            s["_unusable"] = True   # 仅本次运行内生效，不持久化（见上方说明）
+            print(f"[MRI] 配准到标准模板失败，本次运行内标记为不可用: {identifier}（{e}）")
+            raise _UnusableSample() from e
+
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        tmp_path = f"{cache_path}.tmp{os.getpid()}"
+        with open(tmp_path, "wb") as f:   # 用文件对象写入，避免 np.save 自动追加 .npy 后缀
+            np.save(f, vol)
+        os.replace(tmp_path, cache_path)
+        return vol
 
     @staticmethod
     def _resolve_hf_path(s: dict, force_download: bool = False) -> str:

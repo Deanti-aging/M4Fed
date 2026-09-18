@@ -1,6 +1,14 @@
 # MRI 缓存数据（体积过大，不纳入版本控制）
 data/mri_cache/
 
+# 配准到标准模板的结果缓存（experiments/healthy_subset_registered.py 补充实验，
+# 体积过大且可由 register_healthy_subset_mri.py 重新生成，不纳入版本控制）
+data/mri_registered_cache/
+
+# MNI152 标准模板下载缓存（nilearn.datasets.fetch_icbm152_2009，体积较大且可
+# 自动重新下载，不纳入版本控制）
+data/mni_template/
+
 # 预训练模型下载缓存（HuggingFace Hub / torch.hub，体积过大，不纳入版本控制）
 data/model_cache/
 

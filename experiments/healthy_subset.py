@@ -18,8 +18,9 @@ M4Fed 补充实验：仅使用 OpenMind 中 health_status == "healthy" 的数据
         results/<dir>/unusable_samples.csv）
   - 训练/测试划分比例   ：cfg.data.train_split（同 configs/m4fed.yaml）
   - 超参数             ：configs/m4fed.yaml（lr / batch_size / seed / QLoRA 等）
-  - 预热轮数 / 联邦循环 / 本地训练轮数：cfg.federated.warm_rounds /
-    federated_rounds / local_rounds（同 baseline）
+  - 预热轮数 / 联邦循环 / 本地训练轮数：本脚本内覆盖为 50 / 50 / 50
+    （高于 baseline 的 1 / 3 / 3，仅作用于本补充实验，不影响 configs/m4fed.yaml
+    及正式训练）
   - 训练完成后的模型性能评估、偏差因素分析、可视化：直接调用 run_m4fed，与正式
     训练完全一致（domain 指标、服务器端偏差热图、生成模型指标、损失曲线等），
     另外补充绘制 M4Fed-clients / M4Fed-server 的指标柱状图。
@@ -322,7 +323,8 @@ def _flatten_subjects(subj_entries: list) -> list:
     return out
 
 
-def build_node_datasets_from_parts(parts: list, cfg, mri_shape) -> dict:
+def build_node_datasets_from_parts(parts: list, cfg, mri_shape,
+                                    register_to_template: bool = False) -> dict:
     """
     将「受试者级 4 等分」结果组装为 run_m4fed 需要的节点数据集字典。
 
@@ -333,6 +335,10 @@ def build_node_datasets_from_parts(parts: list, cfg, mri_shape) -> dict:
 
     train/test 也按受试者划分：先对受试者列表做 train_test_split_indices，再把各自
     受试者的全部扫描展平——同一受试者要么全在 train、要么全在 test。
+
+    register_to_template : 转发给 OpenMindDataset（见 data/registration.py）。默认
+      False，与本函数改动前行为完全一致；experiments/healthy_subset_registered.py
+      传 True，在这之外不改变任何划分/训练逻辑。
     """
     ts, seed = cfg.data.train_split, cfg.data.seed
 
@@ -341,15 +347,16 @@ def build_node_datasets_from_parts(parts: list, cfg, mri_shape) -> dict:
         tr = _flatten_subjects([subj_entries[i] for i in tr_idx])
         te = _flatten_subjects([subj_entries[i] for i in te_idx])
         return {
-            "train": OpenMindDataset(tr, mri_shape),
-            "test":  OpenMindDataset(te, mri_shape),
+            "train": OpenMindDataset(tr, mri_shape, register_to_template=register_to_template),
+            "test":  OpenMindDataset(te, mri_shape, register_to_template=register_to_template),
         }
 
     return {
         "client_0":       _split(parts[0]),
         "client_1":       _split(parts[1]),
         "server_private": _split(parts[2]),
-        "server_public":  {"train": OpenMindDataset(_flatten_subjects(parts[3]), mri_shape)},
+        "server_public":  {"train": OpenMindDataset(_flatten_subjects(parts[3]), mri_shape,
+                                                      register_to_template=register_to_template)},
     }
 
 
@@ -428,9 +435,25 @@ def _save_metric_bars(results: dict, cfg, out_dir: str) -> None:
 #  主流程                                                                       #
 # --------------------------------------------------------------------------- #
 
-def run_healthy_subset(args, cfg) -> dict:
-    """健康受试者子集上的 M4Fed 补充实验主流程。"""
+def run_healthy_subset(args, cfg, rounds_override=(50, 50, 50),
+                        register_to_template: bool = False) -> dict:
+    """
+    健康受试者子集上的 M4Fed 补充实验主流程。
+
+    rounds_override : (warm_rounds, federated_rounds, local_rounds)，仅覆盖内存中的
+      cfg，不修改 configs/m4fed.yaml（不影响正式训练）。默认 (50, 50, 50)（高于
+      baseline 的 1/3/3），与本函数改动前的行为一致；传 None 则不覆盖，直接使用
+      cfg 中的值（experiments/healthy_subset_registered.py 传 (1, 3, 3)，即
+      baseline 轮数，只保留“是否配准”这一个变量）。
+    register_to_template : 转发给 build_node_datasets_from_parts /
+      OpenMindDataset（见 data/registration.py），默认 False。
+    """
     out_dir = ensure_dir(args.results_dir)
+
+    if rounds_override is not None:
+        cfg.federated.warm_rounds, cfg.federated.federated_rounds, cfg.federated.local_rounds = \
+            rounds_override
+
     mri_shape = tuple(cfg.data.mri_shape)
 
     device = cfg.training.device
@@ -460,7 +483,8 @@ def run_healthy_subset(args, cfg) -> dict:
     #        （同一受试者的全部扫描不跨份、不跨 train/test） ----
     parts = even_4way_split_subjects(subject_groups, seed=cfg.data.seed)
     _save_split_assignment(parts, out_dir)
-    node_datasets = build_node_datasets_from_parts(parts, cfg, mri_shape)
+    node_datasets = build_node_datasets_from_parts(parts, cfg, mri_shape,
+                                                    register_to_template=register_to_template)
 
     # ---- 4. 构建参与者（服务器 + 2 客户端），超参 / 轮数全部取自 cfg（同 baseline） ----
     server = Server(cfg, node_datasets["server_private"],

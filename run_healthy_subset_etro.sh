@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=2-00:00:00
+#SBATCH --time=4-00:00:00
 #SBATCH --output=results/healthy_subset/slurm_%j.log
 set -euo pipefail
 source /FARM/xwang/miniconda3/etc/profile.d/conda.sh
