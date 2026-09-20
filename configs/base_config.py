@@ -205,8 +205,8 @@ class EvalConfig:
     # 每个样本需一次 img2img 合成（ddim_steps 步去噪），值越大评估越慢，故设上限控制耗时
     gen_eval_max_samples: int = 16
     # 生成模型评估的 img2img 噪声强度（评估阶段固定值，独立于训练/联邦阶段的噪声区间）
-    # 取中等强度：既改变足够多细节以体现生成能力，又保留结构使配对指标有意义
-    gen_eval_noise_strength: float = 0.5
+    # 取较低强度：尽量保留源图像结构使配对指标更有意义（下限约为 ddim_steps/T，默认 50/1000=0.05）
+    gen_eval_noise_strength: float = 0.05
     # 图表保存格式：
     # "svg"  ── 矢量图，放大不失真，适合论文投稿（LaTeX/PDF 编译器直接嵌入）
     # "pdf"  ── 矢量图，PDF 阅读器直接打开

@@ -174,41 +174,63 @@ def save_summary(mean: Dict[str, float], std: Dict[str, float], path: str) -> No
 @torch.no_grad()   # 生成阶段不需要梯度
 def visualize_random_samples(
     medmd,                                   # 已训练的 MedMD 生成模型实例
-    mri_shape,                               # 目标 MRI 分辨率 (D, H, W)
+    cfg,                                     # 全局 M4FedConfig 配置对象
+    device: str,                             # 计算设备
     save_path_prefix: str,                   # 网格图保存路径前缀（不含扩展名/视图后缀）
+    mri_shape=None,                          # 生成体积分辨率；None 则用 cfg.data.mri_shape
     fmt: str = "png",                        # 图片格式
-    ddim_steps: int = 20,                    # DDIM 去噪步数
+    ddim_steps: Optional[int] = None,        # DDIM 去噪步数；None 则用 cfg.model.ddim_steps
+    noise_strength: Optional[float] = None,  # img2img 噪声强度；None 则用 cfg.eval.gen_eval_noise_strength
     n_samples: int = 12,                     # 生成样本数（默认 12，对应 3x4 网格）
     n_rows: int = 3,                         # 网格行数
     n_cols: int = 4,                         # 网格列数
+    seed: Optional[int] = None,              # 真实源样本抽样种子（传同一值可让多个方法用同一批源图对比）
 ) -> List[np.ndarray]:
     """
-    用给定 MedMD 生成模型从随机噪声出发生成 n_samples 个 3D MRI 样本，
-    按视图（轴状/冠状/矢状）各保存一张 n_rows x n_cols 紧凑网格图（图中无文字）。
+    随机抽取 n_samples 个真实 MRI（+ 对应文本条件），用给定 MedMD 生成模型做
+    img2img 合成，按视图（轴状/冠状/矢状）各保存一张 n_rows x n_cols 紧凑网格图
+    （图中无文字）。
 
-    使用 synthesise_from_label（纯噪声起点的条件生成，见 MedMD），
-    而非 img2img 合成，因为可视化只需要"模型能生成什么样的 MRI"，
-    不依赖任何真实源图像。每个样本的条件年龄在 [20, 80) 内随机采样，
-    以增加网格内样本的多样性。
+    真实源样本来自 data.openmind_dataset.sample_real_visualization_batch：
+    优先本地 mri_registered_cache，其次本地 mri_cache，最后 HuggingFace 惰性下载
+    （见该函数文档）。相比纯噪声起点的 synthesise_from_label，img2img 合成保留
+    真实解剖结构且以真实文本条件生成，更能体现预训练生成模型的效果。
 
     参数：
       medmd             : MedMD 实例（需已加载训练好的权重）
-      mri_shape         : 生成体积的空间分辨率
+      cfg                : 全局配置（读取数据源、ddim_steps、noise_strength 等）
+      device             : 计算设备
       save_path_prefix  : 网格图保存路径前缀，实际文件名见 plot_mri_grid
-      ddim_steps        : DDIM 去噪步数（可视化用途，无需很多步）
+      mri_shape         : 生成体积的空间分辨率；None 时用 cfg.data.mri_shape
+      ddim_steps        : DDIM 去噪步数；None 时用 cfg.model.ddim_steps
+      noise_strength    : img2img 噪声强度；None 时用 cfg.eval.gen_eval_noise_strength
       n_samples         : 生成样本数，需等于 n_rows * n_cols
+      seed              : 真实源样本的随机抽样种子
 
     返回：
-      生成的体积列表，每个元素形状 (D, H, W)
+      生成的体积列表，每个元素形状 (D, H, W)；真实样本不足 n_samples 时返回空列表
     """
+    from data.openmind_dataset import sample_real_visualization_batch, OpenMindDataset
+
+    mri_shape = tuple(mri_shape or cfg.data.mri_shape)
+    real_samples = sample_real_visualization_batch(cfg, n_samples, seed=seed)
+    if len(real_samples) < n_samples:
+        print(f"[可视化] 可用真实样本不足（{len(real_samples)}/{n_samples}），跳过 {save_path_prefix}")
+        return []
+
+    ds = OpenMindDataset(real_samples, mri_shape)
+    items = [ds[i] for i in range(n_samples)]
+    mri_batch = torch.stack([item["mri"] for item in items]).to(device)   # (n_samples, 1, D, H, W)
+    texts = [item["text"] for item in items]
+
+    if noise_strength is None:
+        noise_strength = getattr(cfg.eval, "gen_eval_noise_strength", cfg.model.noise_strength_fed)
+    if ddim_steps is None:
+        ddim_steps = cfg.model.ddim_steps
+
     medmd.eval()
-    volumes = []
-    for _ in range(n_samples):
-        age_label = int(np.random.uniform(20, 80))   # 随机年龄条件，增加样本多样性
-        vol = medmd.synthesise_from_label(
-            age_label, batch_size=1, mri_shape=mri_shape, ddim_steps=ddim_steps,
-        )
-        volumes.append(vol[0, 0].detach().cpu().numpy())   # (D, H, W)
+    syn = medmd.synthesise(mri_batch, texts, noise_strength=noise_strength, ddim_steps=ddim_steps)
+    volumes = [syn[i, 0].detach().cpu().numpy() for i in range(n_samples)]   # (D, H, W) 每个
 
     from evaluation.visualization import plot_mri_grid   # 局部导入（避免顶层循环依赖）
     plot_mri_grid(volumes, save_path_prefix, fmt=fmt, n_rows=n_rows, n_cols=n_cols)
@@ -225,7 +247,9 @@ def visualize_fan_and_m4fed_samples(
 ) -> Dict[str, List[np.ndarray]]:
     """
     加载 FAN（任一客户端）与 M4Fed（服务器）已训练好的生成模型（MedMD），
-    各自随机生成 n_samples 个 3D MRI 样本，按视图分别保存为紧凑网格图。
+    各自用随机抽取的真实 MRI 做 img2img 合成 n_samples 个样本，按视图分别
+    保存为紧凑网格图（见 visualize_random_samples）。两个方法共用同一批
+    随机抽取的真实源图（固定 seed），便于横向对比生成效果。
 
     权重路径约定（与 federated/methods/fan.py、m4fed.py 的 save_model 调用一致）：
       FAN   : {results_dir}/fan/client_0_medmd.pt   （任取一个客户端，此处固定用 client_0）
@@ -244,6 +268,7 @@ def visualize_fan_and_m4fed_samples(
 
     mri_shape = tuple(mri_shape or cfg.data.mri_shape)
     out_dir = ensure_dir(os.path.join(results_dir, "visualization"))
+    viz_seed = getattr(cfg.data, "seed", 42)   # 固定种子，让各方法用同一批真实源图，便于对比
 
     checkpoints = {
         "fan_client0": os.path.join(results_dir, "fan", "client_0_medmd.pt"),
@@ -259,10 +284,11 @@ def visualize_fan_and_m4fed_samples(
         load_model(medmd, ckpt_path)   # 加载训练好的生成模型权重
         save_path_prefix = os.path.join(out_dir, f"{name}_n{n_samples}")
         vols = visualize_random_samples(
-            medmd, mri_shape, save_path_prefix, fmt=fmt, n_samples=n_samples,
+            medmd, cfg, device, save_path_prefix,
+            mri_shape=mri_shape, fmt=fmt, n_samples=n_samples, seed=viz_seed,
         )
         generated[name] = vols
-        print(f"[可视化] {name} 随机生成 {n_samples} 个 MRI 网格图已保存至 {save_path_prefix}_*.{fmt}")
+        print(f"[可视化] {name} 用真实源图 img2img 合成 {n_samples} 个 MRI 网格图已保存至 {save_path_prefix}_*.{fmt}")
 
     return generated
 

@@ -848,6 +848,84 @@ def make_openmind_sample_loader(
     return _sample_loader_fn   # 返回闭包函数（作为 build_node_datasets 的 sample_loader_fn 参数）
 
 
+def sample_real_visualization_batch(cfg, n_samples: int, seed: Optional[int] = None) -> List[dict]:
+    """
+    随机抽取 n_samples 个真实 OpenMind 样本（MRI + 对应文本/年龄元数据），
+    供生成模型可视化（img2img 合成）使用，让出图更能体现预训练模型的效果。
+
+    数据来源按优先级回退，某一层数量不足时从下一层随机补齐缺口：
+      1. data/mri_registered_cache/ 本地已配准缓存（.npy，无需下载/配准）
+      2. data/mri_cache/（或 cfg.data.cache_dir 指定目录）本地已下载的原始 NIfTI 文件
+      3. HuggingFace（cfg.data.hf_dataset_id）惰性下载（其余样本，__getitem__ 时才下载）
+
+    参数：
+      cfg        : 全局配置（读取 hf_dataset_id / cache_dir）
+      n_samples  : 需要抽取的样本数
+      seed       : 随机种子（None 时每次调用结果不同；传固定值可让多个方法用同一批真实源图）
+
+    返回：
+      样本字典列表（可直接传给 OpenMindDataset(samples, mri_shape) 包装成 Dataset），
+      不足 n_samples 时返回实际可用的数量（如元数据总量过少）。
+    """
+    from .registration import DEFAULT_REGISTERED_CACHE_DIR, registered_cache_path
+
+    df = _load_openmind_metadata(cfg.data.hf_dataset_id, cfg.data.cache_dir or None, "T1w")
+    df = df[df["age"].notna()].reset_index(drop=True)   # 只保留年龄非空的行，与 make_openmind_sample_loader 一致
+    if df.empty:
+        return []
+
+    _repo_data_prefix = cfg.data.hf_dataset_id.split("/")[-1]
+    identifiers = [f"{_repo_data_prefix}/{p}" for p in df["image_path"].tolist()]
+    mri_local_dir = (os.path.join(cfg.data.cache_dir, "mri_files")
+                     if cfg.data.cache_dir else _DEFAULT_MRI_LOCAL_DIR)
+
+    # 逐行判断当前落在哪一层缓存（越靠前优先级越高）
+    registered_paths = [registered_cache_path(ident, DEFAULT_REGISTERED_CACHE_DIR) for ident in identifiers]
+    local_paths = [os.path.join(mri_local_dir, *ident.split("/")) for ident in identifiers]
+    tier_registered = [i for i, p in enumerate(registered_paths) if os.path.exists(p)]
+    tier_local = [i for i, p in enumerate(local_paths)
+                  if os.path.exists(p) and i not in set(tier_registered)]
+    tier_hf = [i for i in range(len(df))
+               if i not in set(tier_registered) and i not in set(tier_local)]
+
+    rng = np.random.default_rng(seed)
+
+    def _shuffled(pool: List[int]) -> List[int]:
+        arr = np.array(pool, dtype=int)
+        return arr[rng.permutation(len(arr))].tolist() if len(arr) else []
+
+    picked: List[Tuple[int, str]] = []
+    for pool, tier in ((tier_registered, "registered"), (tier_local, "local"), (tier_hf, "hf")):
+        if len(picked) >= n_samples:
+            break
+        need = n_samples - len(picked)
+        picked.extend((i, tier) for i in _shuffled(pool)[:need])
+
+    known_unusable = load_known_unusable()
+    samples = []
+    for i, tier in picked:
+        row = df.iloc[i]
+        sample = {
+            "table_text": table_row_to_text(row.reindex(_PATIENT_FIELDS)),
+            "age": float(row["age"]),
+            "metadata": row,
+        }
+        if tier == "registered":
+            sample["mri_array"] = np.load(registered_paths[i])          # 已配准缓存，直接加载
+        elif tier == "local":
+            sample["mri_path"] = local_paths[i]                         # 本地已下载的原始 NIfTI 文件
+        else:
+            ident = identifiers[i]
+            sample["hf_repo_id"] = cfg.data.hf_dataset_id               # 需要时惰性下载
+            sample["hf_image_path"] = ident
+            sample["hf_local_dir"] = mri_local_dir
+            sample["hf_max_cache_bytes"] = None
+            if ident in known_unusable:
+                sample["_unusable"] = True
+        samples.append(sample)
+    return samples
+
+
 # =========================================================================== #
 #  高层构建函数：为每个联邦节点返回训练/测试数据集                                    #
 # =========================================================================== #

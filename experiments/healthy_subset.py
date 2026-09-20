@@ -436,7 +436,8 @@ def _save_metric_bars(results: dict, cfg, out_dir: str) -> None:
 # --------------------------------------------------------------------------- #
 
 def run_healthy_subset(args, cfg, rounds_override=(50, 50, 50),
-                        register_to_template: bool = False) -> dict:
+                        register_to_template: bool = False,
+                        noise_override=None) -> dict:
     """
     健康受试者子集上的 M4Fed 补充实验主流程。
 
@@ -447,12 +448,22 @@ def run_healthy_subset(args, cfg, rounds_override=(50, 50, 50),
       baseline 轮数，只保留“是否配准”这一个变量）。
     register_to_template : 转发给 build_node_datasets_from_parts /
       OpenMindDataset（见 data/registration.py），默认 False。
+    noise_override : (noise_strength_fed, noise_strength_local_min,
+      noise_strength_local_max)，仅覆盖内存中的 cfg.model，不修改
+      configs/m4fed.yaml。默认 None 则不覆盖，直接使用 cfg 中的值（baseline：
+      联邦循环阶段固定 0.75，本地训练阶段 np.random.uniform(0.35, 0.70)）；
+      experiments/healthy_subset_low_noise.py 传 (0.05, 0.05, 0.05)，即联邦循环
+      与本地训练阶段的合成噪声强度都降至 0.05。
     """
     out_dir = ensure_dir(args.results_dir)
 
     if rounds_override is not None:
         cfg.federated.warm_rounds, cfg.federated.federated_rounds, cfg.federated.local_rounds = \
             rounds_override
+
+    if noise_override is not None:
+        (cfg.model.noise_strength_fed, cfg.model.noise_strength_local_min,
+         cfg.model.noise_strength_local_max) = noise_override
 
     mri_shape = tuple(cfg.data.mri_shape)
 
@@ -505,6 +516,10 @@ def run_healthy_subset(args, cfg, rounds_override=(50, 50, 50),
           f"联邦循环轮数={cfg.federated.federated_rounds}  "
           f"本地训练轮数={cfg.federated.local_rounds}  "
           f"train_split={cfg.data.train_split}  seed={cfg.training.seed}")
+    print(f"[healthy] 合成噪声强度：联邦循环阶段(noise_strength_fed)="
+          f"{cfg.model.noise_strength_fed}  "
+          f"本地训练阶段采样区间(noise_strength_local_min~max)="
+          f"[{cfg.model.noise_strength_local_min}, {cfg.model.noise_strength_local_max}]")
 
     # ---- 5. 运行完整 M4Fed 协议：训练 + 性能评估 + 偏差因素分析 + 可视化（同正式训练） ----
     set_seed(cfg.training.seed)
