@@ -221,6 +221,8 @@ def main():
     cfg_fan = copy.deepcopy(cfg)          # 深拷贝配置
     cfg_fan.federated.method = "fan"      # 标记方法名
     cfg_fan.federated.n_clients = 3       # FAN 使用 3 客户端
+    # FAN 联邦循环阶段合成比例固定为 0.1（显式固定，不随 cfg 的默认值变化）
+    cfg_fan.federated.synth_ratio_fed = 0.1
     server3c, clients3c = build_participants(cfg_fan, node_datasets_3, device, n_clients=3)
     set_seed(cfg.training.seed)   # 重置随机种子
     all_results["fan"] = run_fan(server3c, clients3c, cfg_fan, task_specs, results_dir)
