@@ -41,6 +41,7 @@ from utils.io_utils import save_csv, save_model, ensure_dir  # 文件保存工�
 from utils.timing_utils import record_timing                # 计时记录工具
 
 import os                              # 标准库：路径拼接
+import json                            # 标准库：保存年龄 z-score 统计量
 import time                            # 标准库：高精度时间戳
 import pandas as pd                    # Pandas：损失和指标的 CSV 保存
 
@@ -95,6 +96,7 @@ def run_m4fed(
     cfg,              # 全局 M4FedConfig 配置对象
     task_specs: dict, # 预测任务规格字典（任务名 → 类别数/连续类型）
     results_dir: str, # 结果保存根目录（会在其下创建 "m4fed/" 子目录）
+    age_zscore: bool = False,  # 是否对领域模型的年龄训练标签做 z-score 标准化
 ) -> dict:
     """
     运行完整的 M4Fed 三阶段联邦训练协议（论文核心算法）。
@@ -105,6 +107,11 @@ def run_m4fed(
       cfg         : M4FedConfig 配置对象
       task_specs  : 任务规格字典
       results_dir : 结果保存根目录
+      age_zscore  : True 时每个节点用「自身真实训练集」的年龄均值/标准差对 SwinMultiTask
+                    的年龄目标做 z-score（各节点独立统计，不跨节点共享标签统计量），评估时
+                    反变换回原始年龄再算指标；统计量写入 m4fed/age_zscore_stats.json，
+                    供事后从 checkpoint 推理时反变换。只作用于领域模型，MedMD 的文本条件、
+                    TabPFN 补全与合成样本携带的标签均保持原始年龄。默认 False，行为不变。
 
     返回：
       结果字典，包含服务器和各客户端的指标，以及客户端的均值/标准差
@@ -281,6 +288,22 @@ def run_m4fed(
 
     noise_range = (cfg.model.noise_strength_local_min, cfg.model.noise_strength_local_max)
 
+    # ---- 年龄标签 z-score 统计量（仅 age_zscore=True 时）：各节点只用自己的真实训练标签 ----
+    # 服务器领域模型在 公开+私有 训练集上训练（merge_with="all"），客户端只用私有训练集；
+    # 合成样本的年龄标签复制自这些真实样本，分布相同，不单独计入。
+    age_norms = {"server": None, **{f"client_{c.client_id}": None for c in clients}}
+    if age_zscore:
+        age_norms["server"] = _age_stats(server.public_datasets["train"].samples
+                                         + server.private_datasets["train"].samples)
+        for c in clients:
+            age_norms[f"client_{c.client_id}"] = _age_stats(c.private_datasets["train"].samples)
+        with open(os.path.join(out, "age_zscore_stats.json"), "w", encoding="utf-8") as f:
+            json.dump({k: {"mean": v[0], "std": v[1], "n": v[2]} for k, v in age_norms.items()},
+                      f, ensure_ascii=False, indent=2)
+        for k, v in age_norms.items():
+            print(f"  [年龄 z-score] {k}: mean={v[0]:.3f} std={v[1]:.3f} (n={v[2]})")
+        age_norms = {k: v[:2] for k, v in age_norms.items()}
+
     # ---- 服务器本地训练：仅使用私有数据生成合成样本（严格保持私有性）----
     server_syn_local = _synth_local(
         server, server.medmd, noise_range,
@@ -295,6 +318,7 @@ def run_m4fed(
         lr=cfg.training.lr_swin,
         mixed_precision=cfg.training.mixed_precision,
         use_qlora=False,
+        age_norm=age_norms["server"],
     )
     for ep in range(cfg.federated.local_rounds):
         loss = s_nfm_trainer.train_epoch(server_local_loader)
@@ -312,6 +336,7 @@ def run_m4fed(
             use_qlora=True,                        # [M4Fed 专有] 客户端使用 QLoRA 微调
             qlora_r=cfg.federated.qlora_r,
             qlora_alpha=cfg.federated.qlora_alpha,
+            age_norm=age_norms[f"client_{c.client_id}"],
         )
         for ep in range(cfg.federated.local_rounds):
             loss = c_nfm_trainer.train_epoch(c_local_loader)
@@ -329,7 +354,8 @@ def run_m4fed(
     def _eval_node(node_id, swin_model, test_loader, return_raw: bool = False):
         """评估单个节点的脑年龄预测性能（推理模式，不更新参数）。"""
         from training.swin_trainer import SwinTrainer as T
-        trainer = T(swin_model, device=device, lr=0, mixed_precision=False)
+        trainer = T(swin_model, device=device, lr=0, mixed_precision=False,
+                    age_norm=age_norms[node_id])
         y_true, y_pred = trainer.evaluate(test_loader)
         if len(y_true) == 0:
             metrics = {"MAE": float("nan"), "RMSE": float("nan"),
@@ -455,6 +481,17 @@ def _make_trainer(medmd_model, cfg, device):
     """
     return MedMDTrainer(medmd_model, device=device, lr=cfg.training.lr_medmd,
                         mixed_precision=cfg.training.mixed_precision, use_qlora=False)
+
+
+def _age_stats(samples: list) -> Tuple[float, float, int]:
+    """真实训练样本年龄标签的 (mean, std, n)，跳过不可用 / 缺失年龄的样本；std 过小时取 1。"""
+    ages = np.array([float(s["age"]) for s in samples
+                     if not s.get("_unusable") and s.get("age") is not None], dtype=float)
+    ages = ages[np.isfinite(ages)]
+    if ages.size == 0:
+        return 0.0, 1.0, 0
+    std = float(np.std(ages))
+    return float(np.mean(ages)), (std if std > 1e-6 else 1.0), int(ages.size)
 
 
 def _aggregate_metrics(metrics_dict: dict) -> dict:

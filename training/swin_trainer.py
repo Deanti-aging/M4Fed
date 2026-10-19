@@ -50,6 +50,7 @@ class SwinTrainer:
         qlora_dropout: float = 0.05,     # LoRA Dropout 比例
         proximal_mu: float = 0.0,        # FedProx 近端系数（0 = 不使用，退化为 FedAvg）
         global_state: Optional[dict] = None,  # FedProx 需要的全局模型权重（近端项锚点）
+        age_norm: Optional[Tuple[float, float]] = None,  # 年龄标签 z-score 的 (mean, std)；None = 不标准化
     ):
         """
         初始化训练器，配置优化器、QLoRA 和 FedProx 近端项。
@@ -57,12 +58,15 @@ class SwinTrainer:
         参数：
           proximal_mu  : FedProx 近端正则化系数 μ（>0 时启用 FedProx）
           global_state : FedProx 中的全局模型状态字典（与 proximal_mu 配合使用，0 时忽略）
+          age_norm     : (mean, std)。给定时训练目标改为 (age - mean) / std，evaluate 时把
+                         模型输出反变换回原始年龄尺度 pred * std + mean；None 时行为与原来完全一致
         """
         self.model = model                   # 保存 SwinMultiTask 模型引用
         self.device = device                 # 保存计算设备字符串
         self.grad_clip = grad_clip           # 保存梯度裁剪阈值
         self.proximal_mu = proximal_mu       # 保存近端系数（0 = 禁用近端项）
         self.global_state = global_state     # 保存全局权重（用于计算近端项中的 w_global）
+        self.age_norm = age_norm             # 年龄 z-score 参数（None = 原始年龄尺度）
         # 混合精度仅在 CUDA 设备上有效（CPU 不支持 FP16 加速）
         self.mixed_precision = mixed_precision and (device == "cuda")
         # 创建 GradScaler（FP16 梯度缩放，防止下溢）；仅在混合精度模式下使用
@@ -166,6 +170,9 @@ class SwinTrainer:
             # 确保年龄目标始终可用（部分批次 metadata 中提取失败时的兜底）
             if "age" in batch and "age" not in targets:
                 targets["age"] = batch["age"].to(self.device)
+            if self.age_norm is not None and "age" in targets:
+                mean, std = self.age_norm
+                targets["age"] = (targets["age"] - mean) / std   # NaN 保持 NaN，仍被 mask 跳过
 
             self.optimizer.zero_grad()   # 清空梯度（每步前必须执行）
             if self.mixed_precision:
@@ -262,7 +269,9 @@ class SwinTrainer:
             mri = batch["mri"].to(self.device)   # MRI 移到计算设备
             preds = self.model(mri)               # 前向传播，返回各任务预测字典
             # 取年龄预测头的输出，squeeze(-1) 将 (B,1) 压缩为 (B,)
-            age_pred = preds["age"].squeeze(-1).cpu().numpy()
+            age_pred = preds["age"].squeeze(-1).float().cpu().numpy()
+            if self.age_norm is not None:
+                age_pred = age_pred * self.age_norm[1] + self.age_norm[0]   # z-score → 原始年龄
             age_true = batch["age"].numpy()   # 真实年龄（可能含 NaN）
             # 过滤 NaN 标签：np.isnan 返回布尔数组，~ 取反得到有效样本掩膜
             valid = ~np.isnan(age_true)

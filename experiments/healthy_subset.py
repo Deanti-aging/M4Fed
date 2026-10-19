@@ -437,7 +437,8 @@ def _save_metric_bars(results: dict, cfg, out_dir: str) -> None:
 
 def run_healthy_subset(args, cfg, rounds_override=(50, 50, 50),
                         register_to_template: bool = False,
-                        noise_override=None) -> dict:
+                        noise_override=None,
+                        age_zscore: bool = False) -> dict:
     """
     健康受试者子集上的 M4Fed 补充实验主流程。
 
@@ -454,6 +455,9 @@ def run_healthy_subset(args, cfg, rounds_override=(50, 50, 50),
       联邦循环阶段固定 0.75，本地训练阶段 np.random.uniform(0.35, 0.70)）；
       experiments/healthy_subset_low_noise.py 传 (0.05, 0.05, 0.05)，即联邦循环
       与本地训练阶段的合成噪声强度都降至 0.05。
+    age_zscore : 转发给 run_m4fed，对领域模型的年龄训练标签做 z-score 标准化（各节点用
+      自身真实训练集的均值/标准差，评估时反变换回原始年龄）。默认 False；
+      experiments/healthy_subset_registered_age_zscore.py 传 True。
     """
     out_dir = ensure_dir(args.results_dir)
 
@@ -521,9 +525,11 @@ def run_healthy_subset(args, cfg, rounds_override=(50, 50, 50),
           f"本地训练阶段采样区间(noise_strength_local_min~max)="
           f"[{cfg.model.noise_strength_local_min}, {cfg.model.noise_strength_local_max}]")
 
+    print(f"[healthy] 年龄标签 z-score 标准化：{'开启' if age_zscore else '关闭'}")
+
     # ---- 5. 运行完整 M4Fed 协议：训练 + 性能评估 + 偏差因素分析 + 可视化（同正式训练） ----
     set_seed(cfg.training.seed)
-    results = run_m4fed(server, clients, cfg, task_specs, out_dir)
+    results = run_m4fed(server, clients, cfg, task_specs, out_dir, age_zscore=age_zscore)
 
     # ---- 6. 补充：M4Fed-clients / M4Fed-server 指标柱状图与汇总表 ----
     _save_metric_bars(results, cfg, out_dir)
