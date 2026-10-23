@@ -18,9 +18,8 @@ M4Fed 补充实验：仅使用 OpenMind 中 health_status == "healthy" 的数据
         results/<dir>/unusable_samples.csv）
   - 训练/测试划分比例   ：cfg.data.train_split（同 configs/m4fed.yaml）
   - 超参数             ：configs/m4fed.yaml（lr / batch_size / seed / QLoRA 等）
-  - 预热轮数 / 联邦循环 / 本地训练轮数：本脚本内覆盖为 50 / 50 / 50
-    （高于 baseline 的 1 / 3 / 3，仅作用于本补充实验，不影响 configs/m4fed.yaml
-    及正式训练）
+  - 预热轮数 / 联邦循环 / 本地训练轮数：本脚本内覆盖为 baseline 的 1 / 3 / 3
+    （仅作用于本补充实验，不影响 configs/m4fed.yaml 及正式训练）
   - 训练完成后的模型性能评估、偏差因素分析、可视化：直接调用 run_m4fed，与正式
     训练完全一致（domain 指标、服务器端偏差热图、生成模型指标、损失曲线等），
     另外补充绘制 M4Fed-clients / M4Fed-server 的指标柱状图。
@@ -435,7 +434,7 @@ def _save_metric_bars(results: dict, cfg, out_dir: str) -> None:
 #  主流程                                                                       #
 # --------------------------------------------------------------------------- #
 
-def run_healthy_subset(args, cfg, rounds_override=(50, 50, 50),
+def run_healthy_subset(args, cfg, rounds_override=(1, 3, 3),
                         register_to_template: bool = False,
                         noise_override=None,
                         age_zscore: bool = False) -> dict:
@@ -443,10 +442,8 @@ def run_healthy_subset(args, cfg, rounds_override=(50, 50, 50),
     健康受试者子集上的 M4Fed 补充实验主流程。
 
     rounds_override : (warm_rounds, federated_rounds, local_rounds)，仅覆盖内存中的
-      cfg，不修改 configs/m4fed.yaml（不影响正式训练）。默认 (50, 50, 50)（高于
-      baseline 的 1/3/3），与本函数改动前的行为一致；传 None 则不覆盖，直接使用
-      cfg 中的值（experiments/healthy_subset_registered.py 传 (1, 3, 3)，即
-      baseline 轮数，只保留“是否配准”这一个变量）。
+      cfg，不修改 configs/m4fed.yaml（不影响正式训练）。默认 (1, 3, 3)，即
+      baseline 轮数；传 None 则不覆盖，直接使用 cfg 中的值。
     register_to_template : 转发给 build_node_datasets_from_parts /
       OpenMindDataset（见 data/registration.py），默认 False。
     noise_override : (noise_strength_fed, noise_strength_local_min,

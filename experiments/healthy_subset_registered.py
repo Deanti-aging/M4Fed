@@ -2,12 +2,10 @@
 M4Fed 补充实验：在 experiments/healthy_subset.py（健康受试者子集）的基础上，
 额外验证「配准到标准模板」这一 MRI 预处理步骤的影响。
 
-与 healthy_subset.py 的区别仅两处（其余训练/评估/可视化流程完全一致，直接
-复用 healthy_subset.run_healthy_subset）：
-  1. 预热轮数 / 联邦循环 / 本地训练轮数改回 baseline 的 1 / 3 / 3
-     （healthy_subset.py 默认用的是 50 / 50 / 50 的另一组补充实验，两者是
-     两个独立的消融维度，不叠加——本实验只保留“是否配准”这一个变量）。
-  2. 每张 MRI 在 preprocess_mri（裁剪/归一化/插值）之前，先仿射配准到
+与 healthy_subset.py 的区别仅一处（预热轮数 / 联邦循环 / 本地训练轮数同为
+baseline 的 1 / 3 / 3，其余训练/评估/可视化流程完全一致，直接复用
+healthy_subset.run_healthy_subset，只保留“是否配准”这一个变量）：
+  - 每张 MRI 在 preprocess_mri（裁剪/归一化/插值）之前，先仿射配准到
      MNI152 标准模板空间（见 data/registration.py），配准结果落盘缓存于
      data/mri_registered_cache/。
 

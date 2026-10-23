@@ -2,12 +2,10 @@
 M4Fed 补充实验：在 experiments/healthy_subset.py（健康受试者子集）的基础上，
 额外验证「降低 MedMD 合成数据噪声强度」这一因素的影响。
 
-与 healthy_subset.py 的区别仅两处（其余数据筛选/划分/超参/评估/可视化流程
-完全一致，直接复用 healthy_subset.run_healthy_subset）：
-  1. 预热轮数 / 联邦循环 / 本地训练轮数由 baseline 的 1 / 3 / 3 提升为
-     10 / 10 / 10（healthy_subset.py 默认用的是 50 / 50 / 50 的另一组补充
-     实验，两者是两个独立的消融维度，不叠加）。
-  2. 联邦循环阶段与本地训练阶段合成 MedMD 数据时的 img2img 噪声强度，由
+与 healthy_subset.py 的区别仅一处（预热轮数 / 联邦循环 / 本地训练轮数同为
+baseline 的 1 / 3 / 3，其余数据筛选/划分/超参/评估/可视化流程完全一致，直接
+复用 healthy_subset.run_healthy_subset）：
+  - 联邦循环阶段与本地训练阶段合成 MedMD 数据时的 img2img 噪声强度，由
      baseline 的 0.75（federated/methods/m4fed.py 联邦循环阶段固定值）与
      np.random.uniform(0.35, 0.70)（本地训练阶段随机采样区间）均降低为
      0.05，只保留“合成噪声强度高低”这一个变量。
@@ -45,10 +43,10 @@ def main():
     log_path = setup_run_logger(args.results_dir)
     print(f"[healthy-low-noise] 终端日志将同步保存至 {log_path}")
     cfg = load_config(args.config)
-    # 预热/联邦循环/本地训练轮数提升为 10/10/10；联邦循环 + 本地训练阶段的
-    # 合成噪声强度均降至 0.05——与 healthy_subset.py 唯一的两处差异，其余
+    # 预热/联邦循环/本地训练轮数为 baseline 的 1/3/3；联邦循环 + 本地训练阶段的
+    # 合成噪声强度均降至 0.05——与 healthy_subset.py 唯一的差异，其余
     # 数据筛选/划分/超参/评估/可视化逻辑完全共用。
-    run_healthy_subset(args, cfg, rounds_override=(10, 10, 10),
+    run_healthy_subset(args, cfg, rounds_override=(1, 3, 3),
                         noise_override=(0.05, 0.05, 0.05))
 
 

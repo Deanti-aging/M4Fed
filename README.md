@@ -170,8 +170,8 @@ All runs read their hyperparameters from [configs/m4fed.yaml](configs/m4fed.yaml
 
 | Paper section | Command | Rounds R_w/R_f/R_l | Output |
 |---|---|---|---|
-| Healthy-controls reference run (end-to-end, unregistered) | `python experiments/healthy_subset.py --config configs/m4fed.yaml --results_dir results/healthy_subset` | 50/50/50 (script default) | `results/healthy_subset/` |
-| Noise strength σ = 0.05 | `python experiments/healthy_subset_low_noise.py --config configs/m4fed.yaml --results_dir results/healthy_subset_low_noise` | 10/10/10 | `results/healthy_subset_low_noise/` |
+| Healthy-controls reference run (end-to-end, unregistered) | `python experiments/healthy_subset.py --config configs/m4fed.yaml --results_dir results/healthy_subset` | 1/3/3 | `results/healthy_subset/` |
+| Noise strength σ = 0.05 | `python experiments/healthy_subset_low_noise.py --config configs/m4fed.yaml --results_dir results/healthy_subset_low_noise` | 1/3/3 | `results/healthy_subset_low_noise/` |
 | Registration, step 1: register every scan to MNI152 (CPU only, resumable) | `python experiments/register_healthy_subset_mri.py --config configs/m4fed.yaml --results_dir results/register_healthy_subset_mri --workers 16` | – | `data/mri_registered_cache/` |
 | Registration, step 2: train on registered volumes | `python experiments/healthy_subset_registered.py --config configs/m4fed.yaml --results_dir results/healthy_subset_registered_133` | 1/3/3 | `results/healthy_subset_registered_133/` |
 | Label z-score standardization (registered volumes) | `python experiments/healthy_subset_registered_age_zscore.py --config configs/m4fed.yaml --results_dir results/healthy_subset_registered_age_zscore --baseline_dir results/healthy_subset_registered_133` | 1/3/3 | `results/healthy_subset_registered_age_zscore/` |
