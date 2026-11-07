@@ -5,7 +5,7 @@ SwinUNETR 多任务预测模型：骨干网络 + 多个任务头。
 附加任务：其他元数据字段（性别分类、健康状态分类、种族分类等）。
 
 骨干网络：MONAI SwinUNETR encoder（swinViT），Tang et al., CVPR 2022，
-在脑 MRI（MSD 数据集）上用 masked image modeling 自监督预训练。
+在约 5,050 例无标注 3D CT 上自监督预训练（迁移到 MRI 属跨模态）。
 替代原 TensorFlow 版 NeuroFM（NeuroAI-UofG/NeuroFM，与 PyTorch 不兼容）。
 
 加载优先级：
@@ -109,8 +109,9 @@ def _load_swinunetr_backbone(
     """
     构建 SwinUNETR encoder 并可选加载 MONAI 官方自监督预训练权重。
 
-    预训练权重（model_swinvit.pt）：MONAI 在脑 MRI（MSD 数据集）上用
-    masked image modeling 自监督预训练的 SwinViT checkpoint。
+    预训练权重（model_swinvit.pt）：Tang et al. (CVPR 2022) 在约 5,050 例无标注 3D CT 上，
+    以 masked volume inpainting + rotation prediction + contrastive coding 自监督预训练的
+    SwinViT checkpoint（由 MONAI 托管；用于本项目的 MRI 属跨模态迁移）。
     checkpoint 格式：{"state_dict": {...}}，键名含 "module." 前缀（DataParallel 保存）。
 
     pretrain_url 为空串时跳过下载，使用随机初始化权重（仅调试用）。

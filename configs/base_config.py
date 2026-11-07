@@ -91,7 +91,8 @@ class ModelConfig:
     # BioMedCLIP 文本编码器的 HuggingFace 仓库 ID（Microsoft 发布的生物医学 CLIP）
     biomedclip_repo: str = "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
     # SwinUNETR 骨干（swinViT）自监督预训练权重下载 URL
-    # 来源：MONAI 官方在脑 MRI（MSD 数据集）上自监督预训练的 checkpoint（Tang et al., CVPR 2022）
+    # 来源：Tang et al., CVPR 2022 在约 5,050 例无标注 3D CT 上自监督预训练的 checkpoint（MONAI 托管）；
+    # 注意并非脑 MRI 预训练，用于本项目的 MRI 属跨模态迁移
     # 留空 "" 则跳过下载、使用随机初始化（仅用于调试或消融对照实验）
     swinunetr_pretrain_url: str = (
         "https://github.com/Project-MONAI/MONAI-extra-test-data/"
